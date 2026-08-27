@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Darkroom</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Instrument+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<header class="bar">
+  <div class="brand">
+    <h1>Darkroom</h1>
+    <p>Images stay on this machine</p>
+  </div>
+
+  <!-- The claim, as a live instrument reading rather than a badge. -->
+  <div class="ledger" id="ledger" title="Polled from this page every two seconds. Cross-check under DevTools → Application → Storage.">
+    <span class="ledger-title">browser storage in use</span>
+    <dl>
+      <div><dt>local</dt><dd id="m-local">–</dd></div>
+      <div><dt>session</dt><dd id="m-session">–</dd></div>
+      <div><dt>indexeddb</dt><dd id="m-idb">–</dd></div>
+      <div><dt>cache</dt><dd id="m-cache">–</dd></div>
+    </dl>
+  </div>
+
+  <div class="bar-actions">
+    <button id="btn-import" class="btn">Import images</button>
+    <button id="btn-open" class="btn">Open project</button>
+    <button id="btn-save" class="btn" disabled>Save project</button>
+    <button id="btn-export" class="btn btn-key" disabled>Export image</button>
+  </div>
+</header>
+
+<main>
+  <aside class="panel" id="panel" aria-label="Adjustments">
+    <div class="panel-empty" id="panel-empty">
+      <p>No image open.</p>
+      <p class="dim">Import a file or open a saved project to begin.</p>
+    </div>
+
+    <div class="panel-body" id="panel-body" hidden>
+      <section class="group">
+        <h2>Frame</h2>
+        <div class="row-btns">
+          <button class="btn sm" data-act="rot-ccw" title="Rotate left">⟲</button>
+          <button class="btn sm" data-act="rot-cw" title="Rotate right">⟳</button>
+          <button class="btn sm" data-act="flip-h" title="Flip horizontally">⇋</button>
+          <button class="btn sm" data-act="flip-v" title="Flip vertically">⇵</button>
+        </div>
+        <button class="btn wide" id="btn-crop">Crop</button>
+        <button class="btn wide ghost" id="btn-uncrop" hidden>Remove crop</button>
+      </section>
+
+      <section class="group">
+        <h2>Tone</h2>
+        <label class="slider">
+          <span>Brightness</span><output id="o-brightness">0</output>
+          <input type="range" id="s-brightness" min="-100" max="100" value="0">
+        </label>
+        <label class="slider">
+          <span>Contrast</span><output id="o-contrast">0</output>
+          <input type="range" id="s-contrast" min="-100" max="100" value="0">
+        </label>
+        <label class="slider">
+          <span>Saturation</span><output id="o-saturation">0</output>
+          <input type="range" id="s-saturation" min="-100" max="100" value="0">
+        </label>
+      </section>
+
+      <section class="group">
+        <h2>Treatment</h2>
+        <label class="slider">
+          <span>Blur</span><output id="o-blur">0</output>
+          <input type="range" id="s-blur" min="0" max="100" value="0">
+        </label>
+        <label class="check"><input type="checkbox" id="c-grayscale"><span>Black &amp; white</span></label>
+        <label class="check"><input type="checkbox" id="c-invert"><span>Invert</span></label>
+      </section>
+
+      <section class="group">
+        <button class="btn wide ghost" id="btn-reset">Reset all edits</button>
+        <p class="note">Edits are stored as instructions. Your original file is never altered.</p>
+      </section>
+    </div>
+  </aside>
+
+  <section class="stage" id="stage">
+    <div class="stage-inner">
+      <canvas id="canvas" width="1" height="1"></canvas>
+      <div class="crop-layer" id="crop-layer" hidden>
+        <div class="crop-box" id="crop-box"></div>
+      </div>
+    </div>
+    <div class="stage-empty" id="stage-empty">
+      <p>Drop images here</p>
+    </div>
+    <div class="crop-bar" id="crop-bar" hidden>
+      <span>Drag to select the area you want to keep</span>
+      <button class="btn sm ghost" id="btn-crop-cancel">Cancel</button>
+      <button class="btn sm btn-key" id="btn-crop-apply">Apply crop</button>
+    </div>
+  </section>
+</main>
+
+<!-- Signature: loaded images as a negative sleeve. -->
+<footer class="sleeve" id="sleeve" aria-label="Open images">
+  <div class="sprockets" aria-hidden="true"></div>
+  <div class="frames" id="frames"></div>
+  <div class="sprockets" aria-hidden="true"></div>
+</footer>
+
+<div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+
+<input type="file" id="file-images" accept="image/*" multiple hidden>
+<input type="file" id="file-project" accept=".darkroom,application/zip" hidden>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>
