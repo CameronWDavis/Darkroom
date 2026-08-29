@@ -44,6 +44,11 @@
     </div>
 
     <div class="panel-body" id="panel-body" hidden>
+      <div class="history">
+        <button class="btn sm" id="btn-undo" disabled title="Undo (Ctrl+Z)">↶ Undo</button>
+        <button class="btn sm" id="btn-redo" disabled title="Redo (Ctrl+Shift+Z)">↷ Redo</button>
+      </div>
+
       <section class="group">
         <h2>Frame</h2>
         <div class="row-btns">
@@ -54,6 +59,12 @@
         </div>
         <button class="btn wide" id="btn-crop">Crop</button>
         <button class="btn wide ghost" id="btn-uncrop" hidden>Remove crop</button>
+      </section>
+
+      <section class="group">
+        <h2>Draw</h2>
+        <button class="btn wide" id="btn-paint">Brush</button>
+        <button class="btn wide ghost" id="btn-clear-ink" hidden>Clear all drawing</button>
       </section>
 
       <section class="group">
@@ -92,15 +103,59 @@
   <section class="stage" id="stage">
     <div class="stage-inner">
       <canvas id="canvas" width="1" height="1"></canvas>
+      <canvas id="ink" class="ink" hidden></canvas>
       <div class="crop-layer" id="crop-layer" hidden>
-        <div class="crop-box" id="crop-box"></div>
+        <div class="crop-box" id="crop-box">
+          <span class="grid" aria-hidden="true"></span>
+          <i class="h" data-h="nw"></i><i class="h" data-h="n"></i><i class="h" data-h="ne"></i>
+          <i class="h" data-h="w"></i><i class="h" data-h="e"></i>
+          <i class="h" data-h="sw"></i><i class="h" data-h="s"></i><i class="h" data-h="se"></i>
+        </div>
       </div>
     </div>
     <div class="stage-empty" id="stage-empty">
       <p>Drop images here</p>
     </div>
+    <div class="paint-bar" id="paint-bar" hidden>
+      <button class="swatch" id="swatch" title="Choose colour"></button>
+      <label class="inline">
+        <span>Size</span>
+        <input type="range" id="s-brush" min="1" max="100" value="14">
+      </label>
+      <label class="inline">
+        <span>Opacity</span>
+        <input type="range" id="s-alpha" min="5" max="100" value="100">
+      </label>
+      <button class="btn sm" id="btn-eraser" aria-pressed="false">Eraser</button>
+      <button class="btn sm btn-key" id="btn-paint-done">Done</button>
+
+      <div class="wheel-pop" id="wheel-pop" hidden>
+        <canvas id="wheel" width="176" height="176"></canvas>
+        <label class="inline vert">
+          <span>Brightness</span>
+          <input type="range" id="s-value" min="0" max="100" value="100">
+        </label>
+        <div class="swatches" id="swatches"></div>
+        <input type="text" id="hex" class="hex" spellcheck="false" maxlength="7">
+      </div>
+    </div>
+
     <div class="crop-bar" id="crop-bar" hidden>
-      <span>Drag to select the area you want to keep</span>
+      <label class="inline">
+        <span>Ratio</span>
+        <select id="crop-aspect">
+          <option value="0">Free</option>
+          <option value="orig">Original</option>
+          <option value="1">Square</option>
+          <option value="1.25">5:4</option>
+          <option value="1.3333">4:3</option>
+          <option value="1.5">3:2</option>
+          <option value="1.7778">16:9</option>
+          <option value="0.8">4:5</option>
+          <option value="0.6667">2:3</option>
+        </select>
+      </label>
+      <span class="crop-size" id="crop-size">drag to select</span>
       <button class="btn sm ghost" id="btn-crop-cancel">Cancel</button>
       <button class="btn sm btn-key" id="btn-crop-apply">Apply crop</button>
     </div>
@@ -113,6 +168,36 @@
   <div class="frames" id="frames"></div>
   <div class="sprockets" aria-hidden="true"></div>
 </footer>
+
+<dialog class="sheet" id="export-dialog">
+  <h2>Export image</h2>
+
+  <div class="field">
+    <span class="field-label">Format</span>
+    <div class="seg" id="fmt-seg">
+      <button class="btn sm" data-fmt="png">PNG</button>
+      <button class="btn sm" data-fmt="jpeg">JPEG</button>
+    </div>
+    <p class="hint" id="fmt-hint"></p>
+  </div>
+
+  <div class="field" id="quality-field">
+    <label class="slider">
+      <span>Quality</span><output id="o-quality">92</output>
+      <input type="range" id="s-quality" min="40" max="100" value="92">
+    </label>
+  </div>
+
+  <dl class="readout">
+    <div><dt>Output</dt><dd id="x-size">–</dd></div>
+    <div><dt>Filename</dt><dd id="x-name">–</dd></div>
+  </dl>
+
+  <div class="sheet-actions">
+    <button class="btn ghost" id="btn-export-cancel">Cancel</button>
+    <button class="btn btn-key" id="btn-export-go">Choose location…</button>
+  </div>
+</dialog>
 
 <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
 

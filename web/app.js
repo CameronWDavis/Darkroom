@@ -5,22 +5,31 @@ import init, { Editor } from "./pkg/darkroom.js";
 // readLedger(), which only reads counts in order to display them.
 
 const $ = (id) => document.getElementById(id);
+const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
+
 const PREVIEW_CAP = 1600;   // long edge, px
 const THUMB = 240;
+const HISTORY_CAP = 60;     // steps per image
+const MIN_CROP_PX = 18;     // on screen, not in the source
 
 let wasm, ed;
 let layers = [];            // [{id, name, width, height, opCount}]
 let activeId = null;
 let adjust = new Map();     // id -> adjustment struct
+let history = new Map();    // id -> {undo: [], redo: []}
 let thumbUrls = new Map();  // id -> object URL (revoked on replace/remove)
 let cropping = false;
-let pendingCrop = null;     // {x,y,w,h} normalized, while crop mode is open
+let pendingCrop = null;     // normalized, live while crop mode is open
+let gesture = null;         // active crop drag
+let sliderGesture = false;
+let exportFmt = "png";
 let frameQueued = false;
 
 const blank = () => ({
   crop: null, turns: 0, flipH: false, flipV: false,
   brightness: 0, contrast: 0, saturation: 0,
   grayscale: false, invert: false, blur: 0,
+  strokes: [],
 });
 
 // --- ops translation -------------------------------------------------------
@@ -41,6 +50,9 @@ function buildOps(a, { skipGeometry = false } = {}) {
   if (a.grayscale) ops.push({ op: "grayscale" });
   if (a.invert) ops.push({ op: "invert" });
   if (a.blur) ops.push({ op: "blur", amount: a.blur / 100 });
+  // Paint goes last so a stroke sits on top of the tone adjustments instead of
+  // being desaturated along with the photograph.
+  if (a.strokes.length) ops.push({ op: "paint", strokes: a.strokes });
   return ops;
 }
 
@@ -58,10 +70,78 @@ function parseOps(ops) {
       case "grayscale": a.grayscale = true; break;
       case "invert": a.invert = true; break;
       case "blur": a.blur = Math.round(o.amount * 100); break;
+      case "paint": a.strokes = o.strokes || []; break;
     }
   }
   return a;
 }
+
+/** Mirrors crop_normalized() in src/ops.rs so the export dialog can predict
+ *  output dimensions without a round trip. Keep the two in step. */
+function outputSize(l, a) {
+  let w = l.width, h = l.height;
+  if (a.crop) {
+    const px = Math.min(Math.round(a.crop.x * w), w - 1);
+    const py = Math.min(Math.round(a.crop.y * h), h - 1);
+    const cw = clamp(Math.round(a.crop.w * w), 1, w - px);
+    const ch = clamp(Math.round(a.crop.h * h), 1, h - py);
+    w = cw; h = ch;
+  }
+  if (a.turns % 2) { const t = w; w = h; h = t; }
+  return { w, h };
+}
+
+// --- history ---------------------------------------------------------------
+// The adjustment struct is small and flat, so whole-state snapshots are simpler
+// and less error-prone than a command log, and cheap enough not to matter.
+
+// Strokes need a real copy, not a shared reference, or undo would rewrite the
+// history entries it is meant to restore.
+const snap = (a) => ({
+  ...a,
+  crop: a.crop ? { ...a.crop } : null,
+  strokes: a.strokes.map((s) => ({ ...s, points: s.points.slice() })),
+});
+
+function hist(id) {
+  if (!history.has(id)) history.set(id, { undo: [], redo: [] });
+  return history.get(id);
+}
+
+/** Call before mutating, never after. */
+function pushHistory(id = activeId) {
+  if (!id || !adjust.has(id)) return;
+  const h = hist(id);
+  h.undo.push(snap(adjust.get(id)));
+  if (h.undo.length > HISTORY_CAP) h.undo.shift();
+  h.redo.length = 0;
+  updateHistoryButtons();
+}
+
+function step(from, to) {
+  if (!activeId) return;
+  const h = hist(activeId);
+  if (!h[from].length) return;
+  h[to].push(snap(adjust.get(activeId)));
+  adjust.set(activeId, h[from].pop());
+  if (cropping) pendingCrop = adjust.get(activeId).crop;
+  syncControls();
+  scheduleRender();
+  updateHistoryButtons();
+  requestAnimationFrame(() => { refreshLayers(); if (cropping) paintCrop(); });
+}
+
+const undo = () => step("undo", "redo");
+const redo = () => step("redo", "undo");
+
+function updateHistoryButtons() {
+  const h = activeId ? hist(activeId) : { undo: [], redo: [] };
+  $("btn-undo").disabled = !h.undo.length;
+  $("btn-redo").disabled = !h.redo.length;
+}
+
+$("btn-undo").addEventListener("click", undo);
+$("btn-redo").addEventListener("click", redo);
 
 // --- rendering -------------------------------------------------------------
 
@@ -92,7 +172,8 @@ function draw() {
   canvas.width = w; canvas.height = h; canvas.hidden = false;
   canvas.getContext("2d").putImageData(new ImageData(view, w, h), 0, 0);
 
-  if (cropping) requestAnimationFrame(positionCropBox);
+  if (cropping) requestAnimationFrame(paintCrop);
+  if (painting) requestAnimationFrame(syncInk);
 }
 
 function previewCap() {
@@ -169,9 +250,11 @@ function renderStrip() {
 
 function selectLayer(id) {
   if (cropping) exitCrop();
+  if (painting) exitPaint();
   activeId = id;
   if (!adjust.has(id)) adjust.set(id, blank());
   syncControls();
+  updateHistoryButtons();
   renderStrip();
   scheduleRender();
 }
@@ -181,13 +264,16 @@ function removeLayer(id) {
   if (url) { URL.revokeObjectURL(url); thumbUrls.delete(id); }
   ed.remove_image(id);
   adjust.delete(id);
+  history.delete(id);
   if (activeId === id) {
     if (cropping) exitCrop();
+    if (painting) exitPaint();
     const rest = layers.filter((l) => l.id !== id);
     activeId = rest.length ? rest[0].id : null;
   }
   refreshLayers();
   syncControls();
+  updateHistoryButtons();
   scheduleRender();
 }
 
@@ -203,10 +289,12 @@ function syncControls() {
   $("c-grayscale").checked = a.grayscale;
   $("c-invert").checked = a.invert;
   $("btn-uncrop").hidden = !a.crop;
+  $("btn-clear-ink").hidden = !a.strokes.length;
 }
 
 function edit(fn) {
   if (!activeId) return;
+  pushHistory();
   fn(adjust.get(activeId));
   scheduleRender();
   // Strip thumbnails carry the edit count, so refresh after the frame lands.
@@ -215,12 +303,17 @@ function edit(fn) {
 
 for (const k of ["brightness", "contrast", "saturation", "blur"]) {
   $("s-" + k).addEventListener("input", (e) => {
+    if (!activeId) return;
+    // One history entry per drag, not one per pixel of travel.
+    if (!sliderGesture) { sliderGesture = true; pushHistory(); }
     const v = Number(e.target.value);
     $("o-" + k).textContent = v;
-    if (activeId) { adjust.get(activeId)[k] = v; scheduleRender(); }
+    adjust.get(activeId)[k] = v;
+    scheduleRender();
   });
-  $("s-" + k).addEventListener("change", () => refreshLayers());
+  $("s-" + k).addEventListener("change", () => { sliderGesture = false; refreshLayers(); });
 }
+
 $("c-grayscale").addEventListener("change", (e) => edit((a) => (a.grayscale = e.target.checked)));
 $("c-invert").addEventListener("change", (e) => edit((a) => (a.invert = e.target.checked)));
 
@@ -237,6 +330,7 @@ document.querySelectorAll("[data-act]").forEach((b) => {
 
 $("btn-reset").addEventListener("click", () => {
   if (!activeId) return;
+  pushHistory();
   adjust.set(activeId, blank());
   syncControls();
   scheduleRender();
@@ -250,10 +344,156 @@ $("btn-uncrop").addEventListener("click", () => {
 
 // --- crop ------------------------------------------------------------------
 
+const cropRect = () => $("canvas").getBoundingClientRect();
+const toPx = (c, r) => ({ x: c.x * r.width, y: c.y * r.height, w: c.w * r.width, h: c.h * r.height });
+const toNorm = (b, r) => ({ x: b.x / r.width, y: b.y / r.height, w: b.w / r.width, h: b.h / r.height });
+
+function currentAspect() {
+  const v = $("crop-aspect").value;
+  if (v === "0") return 0;
+  if (v === "orig") {
+    const l = layers.find((x) => x.id === activeId);
+    return l ? l.width / l.height : 0;
+  }
+  return Number(v) || 0;
+}
+
+function moveBox(base, dx, dy, r) {
+  return {
+    x: clamp(base.x + dx, 0, r.width - base.w),
+    y: clamp(base.y + dy, 0, r.height - base.h),
+    w: base.w, h: base.h,
+  };
+}
+
+function resizeBox(base, handle, dx, dy, r, aspect) {
+  let x0 = base.x, y0 = base.y, x1 = base.x + base.w, y1 = base.y + base.h;
+  if (handle.includes("w")) x0 += dx;
+  if (handle.includes("e")) x1 += dx;
+  if (handle.includes("n")) y0 += dy;
+  if (handle.includes("s")) y1 += dy;
+
+  // Dragging a handle past its opposite edge flips the box rather than
+  // producing a negative-width rectangle.
+  if (x1 < x0) { const t = x0; x0 = x1; x1 = t; }
+  if (y1 < y0) { const t = y0; y0 = y1; y1 = t; }
+
+  x0 = clamp(x0, 0, r.width);  x1 = clamp(x1, 0, r.width);
+  y0 = clamp(y0, 0, r.height); y1 = clamp(y1, 0, r.height);
+
+  let box = {
+    x: x0, y: y0,
+    w: Math.max(x1 - x0, MIN_CROP_PX),
+    h: Math.max(y1 - y0, MIN_CROP_PX),
+  };
+  if (aspect) box = fitAspect(box, handle, aspect, r);
+
+  box.w = Math.min(box.w, r.width);
+  box.h = Math.min(box.h, r.height);
+  box.x = clamp(box.x, 0, r.width - box.w);
+  box.y = clamp(box.y, 0, r.height - box.h);
+  return box;
+}
+
+/** The canvas is uniformly scaled, so its display aspect equals the source
+ *  aspect and ratios can be enforced in screen pixels. */
+function fitAspect(box, handle, aspect, r) {
+  let { x, y, w, h } = box;
+  const vertical = handle === "n" || handle === "s";
+  if (vertical) w = h * aspect; else h = w / aspect;
+
+  if (w > r.width) { w = r.width; h = w / aspect; }
+  if (h > r.height) { h = r.height; w = h * aspect; }
+
+  // Anchor whichever edges this handle is not dragging.
+  if (handle.includes("w")) x = box.x + box.w - w;
+  if (handle.includes("n")) y = box.y + box.h - h;
+  if (vertical) x = box.x + box.w / 2 - w / 2;
+  if (handle === "e" || handle === "w") y = box.y + box.h / 2 - h / 2;
+
+  return { x, y, w, h };
+}
+
+function paintCrop() {
+  const box = $("crop-box"), layer = $("crop-layer");
+  if (!pendingCrop || pendingCrop.w <= 0 || pendingCrop.h <= 0) {
+    box.classList.remove("on");
+    layer.classList.add("no-sel");
+    $("crop-size").textContent = "drag to select";
+    return;
+  }
+  const r = cropRect(), lr = layer.getBoundingClientRect();
+  const b = toPx(pendingCrop, r);
+  box.style.left = `${r.left - lr.left + b.x}px`;
+  box.style.top = `${r.top - lr.top + b.y}px`;
+  box.style.width = `${b.w}px`;
+  box.style.height = `${b.h}px`;
+  box.classList.add("on");
+  layer.classList.remove("no-sel");
+
+  const src = layers.find((x) => x.id === activeId);
+  if (src) {
+    const w = Math.max(1, Math.round(pendingCrop.w * src.width));
+    const h = Math.max(1, Math.round(pendingCrop.h * src.height));
+    $("crop-size").textContent = `${w} × ${h} px`;
+  }
+}
+
+(() => {
+  const layer = $("crop-layer");
+
+  layer.addEventListener("pointerdown", (e) => {
+    if (!activeId) return;
+    const r = cropRect();
+    const handle = e.target.dataset ? e.target.dataset.h : undefined;
+    const onBox = handle || e.target === $("crop-box");
+
+    if (handle) {
+      gesture = { mode: "resize", handle, sx: e.clientX, sy: e.clientY, r, base: toPx(pendingCrop, r) };
+    } else if (onBox && pendingCrop) {
+      gesture = { mode: "move", sx: e.clientX, sy: e.clientY, r, base: toPx(pendingCrop, r) };
+    } else {
+      // A fresh drag is just a resize from a zero-size box at the pointer.
+      const x = clamp(e.clientX - r.left, 0, r.width);
+      const y = clamp(e.clientY - r.top, 0, r.height);
+      gesture = { mode: "resize", handle: "se", sx: e.clientX, sy: e.clientY, r, base: { x, y, w: 0, h: 0 } };
+    }
+    layer.setPointerCapture(e.pointerId);
+    e.preventDefault();
+  });
+
+  layer.addEventListener("pointermove", (e) => {
+    if (!gesture) return;
+    const dx = e.clientX - gesture.sx, dy = e.clientY - gesture.sy;
+    const box = gesture.mode === "move"
+      ? moveBox(gesture.base, dx, dy, gesture.r)
+      : resizeBox(gesture.base, gesture.handle, dx, dy, gesture.r, currentAspect());
+    pendingCrop = toNorm(box, gesture.r);
+    paintCrop();
+  });
+
+  for (const t of ["pointerup", "pointercancel"]) {
+    layer.addEventListener(t, () => (gesture = null));
+  }
+})();
+
+$("crop-aspect").addEventListener("change", () => {
+  const aspect = currentAspect();
+  if (!aspect || !pendingCrop) return;
+  const r = cropRect();
+  let box = fitAspect(toPx(pendingCrop, r), "se", aspect, r);
+  box.x = clamp(box.x, 0, r.width - box.w);
+  box.y = clamp(box.y, 0, r.height - box.h);
+  pendingCrop = toNorm(box, r);
+  paintCrop();
+});
+
 $("btn-crop").addEventListener("click", () => (cropping ? exitCrop() : enterCrop()));
 $("btn-crop-cancel").addEventListener("click", exitCrop);
+
 $("btn-crop-apply").addEventListener("click", () => {
   if (pendingCrop && pendingCrop.w > 0.005 && pendingCrop.h > 0.005) {
+    pushHistory();
     adjust.get(activeId).crop = pendingCrop;
   }
   exitCrop();
@@ -263,6 +503,7 @@ $("btn-crop-apply").addEventListener("click", () => {
 
 function enterCrop() {
   if (!activeId) return;
+  if (painting) exitPaint();
   cropping = true;
   pendingCrop = adjust.get(activeId).crop;
   $("crop-layer").hidden = false;
@@ -274,6 +515,7 @@ function enterCrop() {
 function exitCrop() {
   cropping = false;
   pendingCrop = null;
+  gesture = null;
   $("crop-layer").hidden = true;
   $("crop-bar").hidden = true;
   $("crop-box").classList.remove("on");
@@ -281,47 +523,345 @@ function exitCrop() {
   scheduleRender();
 }
 
-function positionCropBox() {
-  const box = $("crop-box");
-  if (!pendingCrop) { box.classList.remove("on"); return; }
-  const r = $("canvas").getBoundingClientRect();
-  const l = $("crop-layer").getBoundingClientRect();
-  box.style.left = `${r.left - l.left + pendingCrop.x * r.width}px`;
-  box.style.top = `${r.top - l.top + pendingCrop.y * r.height}px`;
-  box.style.width = `${pendingCrop.w * r.width}px`;
-  box.style.height = `${pendingCrop.h * r.height}px`;
-  box.classList.add("on");
+
+// --- painting --------------------------------------------------------------
+
+let painting = false;
+let inkStroke = null;        // stroke being drawn, in source coordinates
+let brush = { h: 355, s: 0.78, v: 0.85, alpha: 1, size: 14, erase: false };
+let recent = ["#e0a032", "#d24b3f", "#3f7dd2", "#4caf6d", "#f2f0e8", "#14120e"];
+
+/** Undoes the geometry ops, so a point on screen becomes a point on the source.
+ *  This is the exact inverse of map_point() in src/ops.rs -- if the forward
+ *  mapping there changes, this has to change with it. */
+function screenToSource(nx, ny, a) {
+  let x = nx, y = ny;
+  if (a.flipV) y = 1 - y;
+  if (a.flipH) x = 1 - x;
+  const t = a.turns % 4;
+  if (t === 1) { const u = x; x = y; y = 1 - u; }
+  else if (t === 2) { x = 1 - x; y = 1 - y; }
+  else if (t === 3) { const u = x; x = 1 - y; y = u; }
+  if (a.crop) { x = x * a.crop.w + a.crop.x; y = y * a.crop.h + a.crop.y; }
+  return [x, y];
 }
 
-(() => {
-  const layer = $("crop-layer");
-  let origin = null;
-  layer.addEventListener("pointerdown", (e) => {
-    const r = $("canvas").getBoundingClientRect();
-    origin = { x: e.clientX, y: e.clientY, r };
-    layer.setPointerCapture(e.pointerId);
-  });
-  layer.addEventListener("pointermove", (e) => {
-    if (!origin) return;
-    const { r } = origin;
-    const nx = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
-    const x0 = nx(Math.min(origin.x, e.clientX), r.left, r.right);
-    const x1 = nx(Math.max(origin.x, e.clientX), r.left, r.right);
-    const y0 = nx(Math.min(origin.y, e.clientY), r.top, r.bottom);
-    const y1 = nx(Math.max(origin.y, e.clientY), r.top, r.bottom);
-    pendingCrop = {
-      x: (x0 - r.left) / r.width,
-      y: (y0 - r.top) / r.height,
-      w: (x1 - x0) / r.width,
-      h: (y1 - y0) / r.height,
+/** Brush width is a fraction of the source short edge, but the live overlay
+ *  draws in screen pixels, so convert through the preview scale. */
+function brushScreenPx() {
+  const l = layers.find((x) => x.id === activeId);
+  const canvas = $("canvas");
+  if (!l || !canvas.width) return brush.size;
+  const previewScale = Math.min(1, previewCap() / Math.max(l.width, l.height));
+  const sourceShortInPreview = Math.min(l.width, l.height) * previewScale;
+  const screenPerPreview = canvas.getBoundingClientRect().width / canvas.width;
+  return widthFraction() * sourceShortInPreview * screenPerPreview;
+}
+
+const widthFraction = () => (brush.size / 100) * 0.18 + 0.002;
+
+function hsvToRgb(h, s, v) {
+  const c = v * s, x = c * (1 - Math.abs(((h / 60) % 2) - 1)), m = v - c;
+  const t = [[c,x,0],[x,c,0],[0,c,x],[0,x,c],[x,0,c],[c,0,x]][Math.floor(h / 60) % 6];
+  return t.map((n) => Math.round((n + m) * 255));
+}
+
+function rgbToHex([r, g, b]) {
+  return "#" + [r, g, b].map((n) => n.toString(16).padStart(2, "0")).join("");
+}
+
+function hexToHsv(hex) {
+  const m = /^#?([0-9a-f]{6})$/i.exec(hex.trim());
+  if (!m) return null;
+  const n = parseInt(m[1], 16);
+  const r = ((n >> 16) & 255) / 255, g = ((n >> 8) & 255) / 255, b = (n & 255) / 255;
+  const mx = Math.max(r, g, b), mn = Math.min(r, g, b), d = mx - mn;
+  let h = 0;
+  if (d) {
+    if (mx === r) h = 60 * (((g - b) / d) % 6);
+    else if (mx === g) h = 60 * ((b - r) / d + 2);
+    else h = 60 * ((r - g) / d + 4);
+  }
+  return { h: (h + 360) % 360, s: mx ? d / mx : 0, v: mx };
+}
+
+const brushRgb = () => hsvToRgb(brush.h, brush.s, brush.v);
+
+function drawWheel() {
+  const c = $("wheel"), ctx = c.getContext("2d");
+  const n = c.width, r = n / 2;
+  const img = ctx.createImageData(n, n);
+  for (let y = 0; y < n; y++) {
+    for (let x = 0; x < n; x++) {
+      const dx = x - r + 0.5, dy = y - r + 0.5;
+      const dist = Math.hypot(dx, dy);
+      const i = (y * n + x) * 4;
+      if (dist > r) { img.data[i + 3] = 0; continue; }
+      const hue = (Math.atan2(dy, dx) * 180 / Math.PI + 360) % 360;
+      const [rr, gg, bb] = hsvToRgb(hue, Math.min(dist / r, 1), brush.v);
+      img.data[i] = rr; img.data[i + 1] = gg; img.data[i + 2] = bb;
+      // Feather the rim so the disc does not look jagged.
+      img.data[i + 3] = Math.round(255 * Math.min(1, r - dist));
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+
+  const ang = brush.h * Math.PI / 180, rad = brush.s * r;
+  const px = r + Math.cos(ang) * rad, py = r + Math.sin(ang) * rad;
+  ctx.beginPath();
+  ctx.arc(px, py, 6, 0, Math.PI * 2);
+  ctx.strokeStyle = brush.v > 0.55 ? "#14120e" : "#e8e2d4";
+  ctx.lineWidth = 2;
+  ctx.stroke();
+}
+
+function syncBrush() {
+  const hex = rgbToHex(brushRgb());
+  $("swatch").style.setProperty("--sw", hex);
+  $("swatch").style.opacity = String(brush.alpha);
+  if (document.activeElement !== $("hex")) $("hex").value = hex;
+  $("btn-eraser").setAttribute("aria-pressed", String(brush.erase));
+  drawWheel();
+}
+
+function renderSwatches() {
+  const box = $("swatches");
+  box.replaceChildren();
+  for (const hex of recent.slice(0, 16)) {
+    const b = document.createElement("button");
+    b.style.background = hex;
+    b.title = hex;
+    b.onclick = () => {
+      const c = hexToHsv(hex);
+      if (c) { Object.assign(brush, c); syncBrush(); }
     };
-    positionCropBox();
-  });
-  layer.addEventListener("pointerup", () => (origin = null));
+    box.append(b);
+  }
+}
+
+function rememberColour(hex) {
+  recent = [hex, ...recent.filter((c) => c !== hex)].slice(0, 16);
+  renderSwatches();
+}
+
+function syncInk() {
+  const ink = $("ink"), canvas = $("canvas");
+  const r = canvas.getBoundingClientRect();
+  const parent = ink.parentElement.getBoundingClientRect();
+  ink.width = Math.round(r.width);
+  ink.height = Math.round(r.height);
+  ink.style.left = `${r.left - parent.left}px`;
+  ink.style.top = `${r.top - parent.top}px`;
+}
+
+function enterPaint() {
+  if (!activeId) return;
+  if (cropping) exitCrop();
+  painting = true;
+  $("paint-bar").hidden = false;
+  $("ink").hidden = false;
+  $("btn-paint").textContent = "Close brush";
+  syncBrush();
+  renderSwatches();
+  requestAnimationFrame(syncInk);
+}
+
+function exitPaint() {
+  painting = false;
+  inkStroke = null;
+  $("paint-bar").hidden = true;
+  $("wheel-pop").hidden = true;
+  $("ink").hidden = true;
+  $("btn-paint").textContent = "Brush";
+}
+
+$("btn-paint").addEventListener("click", () => (painting ? exitPaint() : enterPaint()));
+$("btn-paint-done").addEventListener("click", exitPaint);
+$("btn-clear-ink").addEventListener("click", () => {
+  edit((a) => (a.strokes = []));
+  syncControls();
+});
+
+$("swatch").addEventListener("click", () => {
+  const p = $("wheel-pop");
+  p.hidden = !p.hidden;
+  if (!p.hidden) drawWheel();
+});
+
+$("s-brush").addEventListener("input", (e) => (brush.size = Number(e.target.value)));
+$("s-alpha").addEventListener("input", (e) => { brush.alpha = Number(e.target.value) / 100; syncBrush(); });
+$("s-value").addEventListener("input", (e) => { brush.v = Number(e.target.value) / 100; syncBrush(); });
+$("btn-eraser").addEventListener("click", () => { brush.erase = !brush.erase; syncBrush(); });
+
+$("hex").addEventListener("change", (e) => {
+  const c = hexToHsv(e.target.value);
+  if (c) { Object.assign(brush, c); $("s-value").value = Math.round(c.v * 100); syncBrush(); }
+  else syncBrush();
+});
+
+(() => {
+  const c = $("wheel");
+  let down = false;
+  const pick = (e) => {
+    const r = c.getBoundingClientRect(), rad = r.width / 2;
+    const dx = e.clientX - r.left - rad, dy = e.clientY - r.top - rad;
+    brush.h = (Math.atan2(dy, dx) * 180 / Math.PI + 360) % 360;
+    brush.s = Math.min(Math.hypot(dx, dy) / rad, 1);
+    syncBrush();
+  };
+  c.addEventListener("pointerdown", (e) => { down = true; c.setPointerCapture(e.pointerId); pick(e); });
+  c.addEventListener("pointermove", (e) => down && pick(e));
+  for (const t of ["pointerup", "pointercancel"]) {
+    c.addEventListener(t, () => { down = false; rememberColour(rgbToHex(brushRgb())); });
+  }
 })();
 
-document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && cropping) exitCrop();
+(() => {
+  const ink = $("ink");
+  let last = null;
+
+  const at = (e) => {
+    const r = ink.getBoundingClientRect();
+    return [e.clientX - r.left, e.clientY - r.top];
+  };
+
+  ink.addEventListener("pointerdown", (e) => {
+    if (!activeId) return;
+    ink.setPointerCapture(e.pointerId);
+    const [rgb, a] = [brushRgb(), adjust.get(activeId)];
+    inkStroke = {
+      color: [...rgb, Math.round(brush.alpha * 255)],
+      width: widthFraction(),
+      erase: brush.erase,
+      points: [],
+    };
+    last = at(e);
+    pushPoint(e, a);
+    paintLive(last, last);
+    e.preventDefault();
+  });
+
+  ink.addEventListener("pointermove", (e) => {
+    if (!inkStroke) return;
+    const p = at(e);
+    // Thin out the point list: anything closer than a couple of pixels adds
+    // bytes to the project file without changing the visible line.
+    if (Math.hypot(p[0] - last[0], p[1] - last[1]) < 2) return;
+    pushPoint(e, adjust.get(activeId));
+    paintLive(last, p);
+    last = p;
+  });
+
+  for (const t of ["pointerup", "pointercancel", "pointerleave"]) {
+    ink.addEventListener(t, () => {
+      if (!inkStroke) return;
+      const stroke = inkStroke;
+      inkStroke = null;
+      ink.getContext("2d").clearRect(0, 0, ink.width, ink.height);
+      if (stroke.points.length < 2) return;
+      // One history entry per stroke, so Ctrl+Z lifts the last line.
+      pushHistory();
+      adjust.get(activeId).strokes.push(stroke);
+      if (!stroke.erase) rememberColour(rgbToHex(stroke.color.slice(0, 3)));
+      scheduleRender();
+      syncControls();
+      requestAnimationFrame(refreshLayers);
+    });
+  }
+
+  function pushPoint(e, a) {
+    const ink = $("ink"), r = ink.getBoundingClientRect();
+    const nx = (e.clientX - r.left) / r.width;
+    const ny = (e.clientY - r.top) / r.height;
+    const [sx, sy] = screenToSource(nx, ny, a);
+    inkStroke.points.push(sx, sy);
+  }
+
+  /** Immediate feedback on a plain 2D context. The authoritative render still
+   *  happens in Rust when the stroke is committed. */
+  function paintLive(a, b) {
+    const ctx = $("ink").getContext("2d");
+    ctx.save();
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    ctx.lineWidth = brushScreenPx();
+    if (brush.erase) {
+      ctx.globalCompositeOperation = "destination-out";
+      ctx.strokeStyle = "rgba(0,0,0,1)";
+    } else {
+      ctx.strokeStyle = `rgba(${brushRgb().join(",")},${brush.alpha})`;
+    }
+    ctx.beginPath();
+    ctx.moveTo(a[0], a[1]);
+    ctx.lineTo(b[0], b[1]);
+    ctx.stroke();
+    ctx.restore();
+  }
+})();
+
+// --- export ----------------------------------------------------------------
+
+$("btn-export").addEventListener("click", () => {
+  if (!activeId) return;
+  const l = layers.find((x) => x.id === activeId);
+  exportFmt = /\.jpe?g$/i.test(l?.name || "") ? "jpeg" : "png";
+  syncExport();
+  $("export-dialog").showModal();
+});
+
+document.querySelectorAll("#fmt-seg .btn").forEach((b) => {
+  b.addEventListener("click", () => { exportFmt = b.dataset.fmt; syncExport(); });
+});
+
+$("s-quality").addEventListener("input", (e) => ($("o-quality").textContent = e.target.value));
+$("btn-export-cancel").addEventListener("click", () => $("export-dialog").close());
+
+function syncExport() {
+  for (const b of document.querySelectorAll("#fmt-seg .btn")) {
+    b.setAttribute("aria-pressed", String(b.dataset.fmt === exportFmt));
+  }
+  $("quality-field").hidden = exportFmt !== "jpeg";
+  $("fmt-hint").textContent = exportFmt === "png"
+    ? "Lossless, and keeps transparency. Larger files."
+    : "Much smaller files. Transparent areas are filled with white.";
+
+  const l = layers.find((x) => x.id === activeId);
+  const a = adjust.get(activeId);
+  if (!l || !a) return;
+  const s = outputSize(l, a);
+  $("x-size").textContent = `${s.w} × ${s.h} px`;
+  try { $("x-name").textContent = ed.export_name(activeId, exportFmt); } catch {}
+}
+
+$("btn-export-go").addEventListener("click", async () => {
+  const btn = $("btn-export-go");
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "Rendering…";
+  // Full-resolution rendering blocks the main thread. Yield two frames so the
+  // label actually paints before we do. A worker is the real fix.
+  await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+
+  let bytes, name;
+  try {
+    const q = Number($("s-quality").value);
+    bytes = ed.export(activeId, exportFmt, q);
+    name = ed.export_name(activeId, exportFmt);
+  } catch (e) {
+    btn.disabled = false; btn.textContent = label;
+    return fail(e);
+  }
+
+  btn.disabled = false;
+  btn.textContent = label;
+  $("export-dialog").close();
+
+  const type = exportFmt === "png" ? "image/png" : "image/jpeg";
+  const ok = await putFile(new Blob([bytes], { type }), name, {
+    description: exportFmt === "png" ? "PNG image" : "JPEG image",
+    accept: { [type]: [exportFmt === "png" ? ".png" : ".jpg"] },
+  });
+  if (ok) say(`Exported ${name} — ${(bytes.length / 1024).toFixed(0)} KB.`);
 });
 
 // --- files -----------------------------------------------------------------
@@ -354,6 +894,7 @@ async function importFiles(files) {
   if (!added) return;
   refreshLayers();
   syncControls();
+  updateHistoryButtons();
   scheduleRender();
   say(`Imported ${added} image${added > 1 ? "s" : ""}.`);
 }
@@ -367,6 +908,7 @@ async function openProject(file) {
   for (const url of thumbUrls.values()) URL.revokeObjectURL(url);
   thumbUrls.clear();
   adjust.clear();
+  history.clear();
   activeId = null;
 
   try { layers = JSON.parse(ed.layers_json()); } catch (e) { return fail(e); }
@@ -375,6 +917,7 @@ async function openProject(file) {
 
   refreshLayers();
   syncControls();
+  updateHistoryButtons();
   scheduleRender();
   say(`Opened ${file.name} — ${layers.length} image${layers.length === 1 ? "" : "s"}, edits intact.`);
 }
@@ -386,23 +929,6 @@ $("btn-save").addEventListener("click", async () => {
     description: "Darkroom project", accept: { "application/zip": [".darkroom"] },
   });
   if (ok) say("Project saved. Nothing was written to this browser.");
-});
-
-$("btn-export").addEventListener("click", async () => {
-  if (!activeId) return;
-  const png = !/\.jpe?g$/i.test(layers.find((l) => l.id === activeId)?.name || "");
-  const fmt = png ? "png" : "jpeg";
-  let bytes, name;
-  try {
-    bytes = ed.export(activeId, fmt, 92);
-    name = ed.export_name(activeId, fmt);
-  } catch (e) { return fail(e); }
-  const type = png ? "image/png" : "image/jpeg";
-  const ok = await putFile(new Blob([bytes], { type }), name, {
-    description: png ? "PNG image" : "JPEG image",
-    accept: { [type]: [png ? ".png" : ".jpg"] },
-  });
-  if (ok) say(`Exported ${name}.`);
 });
 
 /** Writes to a location the user picks. Falls back to a download on browsers
@@ -442,6 +968,18 @@ stage.addEventListener("drop", async (e) => {
   const proj = files.find((f) => f.name.endsWith(".darkroom"));
   if (proj) await openProject(proj);
   else await importFiles(files);
+});
+
+// --- keyboard --------------------------------------------------------------
+
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && cropping) { exitCrop(); return; }
+  if (e.key === "Escape" && painting) { exitPaint(); return; }
+  if ($("export-dialog").open) return;
+  if (!(e.ctrlKey || e.metaKey)) return;
+  const k = e.key.toLowerCase();
+  if (k === "z") { e.preventDefault(); e.shiftKey ? redo() : undo(); }
+  else if (k === "y") { e.preventDefault(); redo(); }
 });
 
 // --- storage ledger --------------------------------------------------------
@@ -485,7 +1023,11 @@ function fail(e) {
   console.error(e);
 }
 
-window.addEventListener("resize", () => { if (activeId) scheduleRender(); });
+window.addEventListener("resize", () => {
+  if (activeId) scheduleRender();
+  if (cropping) paintCrop();
+  if (painting) syncInk();
+});
 
 // Best-effort scrub on unload. The tab teardown does the real work.
 window.addEventListener("pagehide", () => {

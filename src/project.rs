@@ -1,6 +1,11 @@
 //! The `.darkroom` bundle: a plain zip containing a JSON manifest and the
 //! original, unmodified source files.
 //!
+//! Two properties matter here. First, the originals go in byte-for-byte, so a
+//! bundle is always a superset of what you imported and an edit can never
+//! destroy the source. Second, the manifest is human-readable JSON -- open the
+//! zip in any archive tool and you can see exactly what is stored about you,
+//! which is the whole point.
 
 use crate::ops::Op;
 use image::RgbaImage;
@@ -10,7 +15,8 @@ use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 pub const FORMAT: &str = "darkroom-project";
-pub const VERSION: u32 = 1;
+/// v2 added the `paint` op. v1 bundles still load: serde simply never sees one.
+pub const VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Manifest {

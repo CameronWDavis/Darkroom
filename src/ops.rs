@@ -1,12 +1,30 @@
 //! The edit pipeline.
 //!
-//! Every op here is resolution-independent: geometry is stored in normalized
-//! 0..1 coordinates and effect radii are stored as a fraction of the image's
-//! short edge. That is what lets the same `Vec<Op>` render identically against
-//! a 1200px preview and a 6000px export without any conversion step.
+//! Most ops are resolution-independent parameterized transforms: geometry is
+//! stored in normalized 0..1 coordinates and effect radii as a fraction of the
+//! image's short edge. That is what lets the same `Vec<Op>` render identically
+//! against a 1200px preview and a 6000px export without any conversion step.
+//!
+//! `Paint` is the exception, and the reason `apply_all` is not a plain fold.
+//! Stroke points are stored in *source* coordinates so they survive a later
+//! crop or rotation, which means painting has to know which geometry ops ran
+//! ahead of it. The pipeline therefore carries a running geometry transform.
 
 use image::{imageops, Rgba, RgbaImage};
 use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Stroke {
+    /// Straight (non-premultiplied) RGBA.
+    pub color: [u8; 4],
+    /// Brush diameter as a fraction of the source short edge.
+    pub width: f32,
+    #[serde(default)]
+    pub erase: bool,
+    /// Flat x,y pairs in normalized source coordinates. Flat rather than
+    /// nested to keep the manifest small; a long session is a lot of numbers.
+    pub points: Vec<f32>,
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -27,14 +45,34 @@ pub enum Op {
     Invert,
     /// 0.0 .. 1.0 as a fraction of the short edge.
     Blur { amount: f32 },
+    /// Always last in the array, so paint sits on top of tone adjustments
+    /// rather than being desaturated along with the photograph.
+    Paint { strokes: Vec<Stroke> },
 }
 
-/// Applies ops in array order. The caller is responsible for supplying them in
-/// a sensible order; the UI enforces geometry -> color -> effects.
+fn is_geometry(op: &Op) -> bool {
+    matches!(op, Op::Crop { .. } | Op::Rotate { .. } | Op::FlipH | Op::FlipV)
+}
+
+/// Applies ops in array order. The caller supplies them in a sensible order;
+/// the UI enforces geometry -> tone -> effects -> paint.
 pub fn apply_all(src: &RgbaImage, ops: &[Op]) -> RgbaImage {
+    // Brush radius is anchored to the image handed in here, so a stroke keeps
+    // the same apparent thickness on a preview and on a full export, and does
+    // not thicken when a later crop shrinks the frame.
+    let base_short = src.width().min(src.height()).max(1) as f32;
+
     let mut img = src.clone();
+    let mut geo: Vec<Op> = Vec::new();
     for op in ops {
-        img = apply_one(img, op);
+        if let Op::Paint { strokes } = op {
+            paint(&mut img, strokes, &geo, base_short);
+        } else {
+            if is_geometry(op) {
+                geo.push(op.clone());
+            }
+            img = apply_one(img, op);
+        }
     }
     img
 }
@@ -96,6 +134,8 @@ fn apply_one(img: RgbaImage, op: &Op) -> RgbaImage {
                 imageops::blur(&img, sigma)
             }
         }
+        // Handled in apply_all, which has the geometry context this needs.
+        Op::Paint { .. } => img,
     }
 }
 
@@ -115,6 +155,194 @@ fn crop_normalized(img: &RgbaImage, x: f32, y: f32, w: f32, h: f32) -> RgbaImage
     let ph = ((h.clamp(0.0, 1.0) * ih as f32).round() as u32).clamp(1, ih - py);
     imageops::crop_imm(img, px, py, pw, ph).to_image()
 }
+
+// --- painting --------------------------------------------------------------
+
+/// Walks a normalized source point through the geometry applied so far. This
+/// is the forward direction; `app.js` implements the inverse, so a pointer
+/// position on screen can be turned back into source coordinates.
+fn map_point(mut x: f32, mut y: f32, geo: &[Op]) -> (f32, f32) {
+    for op in geo {
+        match *op {
+            Op::Crop { x: cx, y: cy, w: cw, h: ch } => {
+                x = (x - cx) / cw.max(1e-6);
+                y = (y - cy) / ch.max(1e-6);
+            }
+            Op::Rotate { turns } => {
+                let (nx, ny) = match turns % 4 {
+                    1 => (1.0 - y, x),
+                    2 => (1.0 - x, 1.0 - y),
+                    3 => (y, 1.0 - x),
+                    _ => (x, y),
+                };
+                x = nx;
+                y = ny;
+            }
+            Op::FlipH => x = 1.0 - x,
+            Op::FlipV => y = 1.0 - y,
+            _ => {}
+        }
+    }
+    (x, y)
+}
+
+fn paint(img: &mut RgbaImage, strokes: &[Stroke], geo: &[Op], base_short: f32) {
+    let (w, h) = (img.width() as i64, img.height() as i64);
+    if w == 0 || h == 0 || strokes.is_empty() {
+        return;
+    }
+
+    // An eraser has to remove paint without punching a hole in the photograph,
+    // so it needs its own transparent layer to subtract from. With no eraser
+    // present we composite straight onto the image and skip the allocation,
+    // which at export resolution is worth a few hundred megabytes.
+    let needs_layer = strokes.iter().any(|s| s.erase);
+    let mut layer = needs_layer.then(|| RgbaImage::new(img.width(), img.height()));
+
+    // Coverage accumulates per stroke before compositing. Blending each segment
+    // as it is drawn would darken every joint where consecutive stamps overlap.
+    let mut mask = vec![0u8; (w * h) as usize];
+
+    for s in strokes {
+        if s.points.len() < 2 {
+            continue;
+        }
+        let r = (s.width * base_short * 0.5).max(0.5);
+
+        let pts: Vec<(f32, f32)> = s
+            .points
+            .chunks_exact(2)
+            .map(|c| {
+                let (nx, ny) = map_point(c[0], c[1], geo);
+                (nx * w as f32, ny * h as f32)
+            })
+            .collect();
+
+        let pad = r + 2.0;
+        let bx0 = (pts.iter().map(|p| p.0).fold(f32::MAX, f32::min) - pad).floor().max(0.0) as i64;
+        let bx1 = (pts.iter().map(|p| p.0).fold(f32::MIN, f32::max) + pad).ceil().clamp(0.0, w as f32) as i64;
+        let by0 = (pts.iter().map(|p| p.1).fold(f32::MAX, f32::min) - pad).floor().max(0.0) as i64;
+        let by1 = (pts.iter().map(|p| p.1).fold(f32::MIN, f32::max) + pad).ceil().clamp(0.0, h as f32) as i64;
+        if bx1 <= bx0 || by1 <= by0 {
+            continue;
+        }
+        let bb = (bx0, by0, bx1, by1);
+
+        for y in by0..by1 {
+            let row = (y * w) as usize;
+            mask[row + bx0 as usize..row + bx1 as usize].fill(0);
+        }
+
+        // A single tap is a zero-length segment, which the distance function
+        // treats as a plain point, so it lands as a round dot.
+        let segs = if pts.len() == 1 { 1 } else { pts.len() - 1 };
+        for i in 0..segs {
+            let a = pts[i];
+            let b = pts[(i + 1).min(pts.len() - 1)];
+            stamp(&mut mask, w, bb, a, b, r);
+        }
+
+        composite(img, layer.as_mut(), &mask, w, bb, s);
+    }
+
+    if let Some(l) = layer {
+        over(img, &l);
+    }
+}
+
+fn stamp(mask: &mut [u8], w: i64, bb: (i64, i64, i64, i64), a: (f32, f32), b: (f32, f32), r: f32) {
+    let pad = r + 2.0;
+    let x0 = ((a.0.min(b.0) - pad).floor() as i64).max(bb.0);
+    let x1 = ((a.0.max(b.0) + pad).ceil() as i64).min(bb.2);
+    let y0 = ((a.1.min(b.1) - pad).floor() as i64).max(bb.1);
+    let y1 = ((a.1.max(b.1) + pad).ceil() as i64).min(bb.3);
+
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let d = dist_to_segment(x as f32 + 0.5, y as f32 + 0.5, a, b);
+            // One pixel of feathering at the edge: cheap antialiasing.
+            let cov = (r + 0.5 - d).clamp(0.0, 1.0);
+            if cov > 0.0 {
+                let i = (y * w + x) as usize;
+                let v = (cov * 255.0) as u8;
+                if v > mask[i] {
+                    mask[i] = v;
+                }
+            }
+        }
+    }
+}
+
+fn dist_to_segment(px: f32, py: f32, a: (f32, f32), b: (f32, f32)) -> f32 {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let len2 = dx * dx + dy * dy;
+    let t = if len2 <= f32::EPSILON {
+        0.0
+    } else {
+        (((px - a.0) * dx + (py - a.1) * dy) / len2).clamp(0.0, 1.0)
+    };
+    let (cx, cy) = (a.0 + t * dx, a.1 + t * dy);
+    ((px - cx).powi(2) + (py - cy).powi(2)).sqrt()
+}
+
+fn composite(
+    img: &mut RgbaImage,
+    layer: Option<&mut RgbaImage>,
+    mask: &[u8],
+    w: i64,
+    bb: (i64, i64, i64, i64),
+    s: &Stroke,
+) {
+    let target = match layer {
+        Some(l) => l,
+        None => img,
+    };
+    for y in bb.1..bb.3 {
+        for x in bb.0..bb.2 {
+            let cov = mask[(y * w + x) as usize] as f32 / 255.0;
+            if cov <= 0.0 {
+                continue;
+            }
+            let dst = target.get_pixel_mut(x as u32, y as u32);
+            if s.erase {
+                // Destination-out against the paint layer only.
+                dst[3] = (dst[3] as f32 * (1.0 - cov)) as u8;
+            } else {
+                let sa = cov * (s.color[3] as f32 / 255.0);
+                let da = dst[3] as f32 / 255.0;
+                let out_a = sa + da * (1.0 - sa);
+                if out_a > 0.0 {
+                    for c in 0..3 {
+                        let v = (s.color[c] as f32 * sa + dst[c] as f32 * da * (1.0 - sa)) / out_a;
+                        dst[c] = clamp8(v);
+                    }
+                }
+                dst[3] = clamp8(out_a * 255.0);
+            }
+        }
+    }
+}
+
+/// Source-over of the paint layer onto the photograph.
+fn over(img: &mut RgbaImage, layer: &RgbaImage) {
+    for (dst, src) in img.pixels_mut().zip(layer.pixels()) {
+        let sa = src[3] as f32 / 255.0;
+        if sa <= 0.0 {
+            continue;
+        }
+        let da = dst[3] as f32 / 255.0;
+        let out_a = sa + da * (1.0 - sa);
+        if out_a > 0.0 {
+            for c in 0..3 {
+                let v = (src[c] as f32 * sa + dst[c] as f32 * da * (1.0 - sa)) / out_a;
+                dst[c] = clamp8(v);
+            }
+        }
+        dst[3] = clamp8(out_a * 255.0);
+    }
+}
+
+// --- helpers ---------------------------------------------------------------
 
 #[inline]
 fn luma(c: &Rgba<u8>) -> f32 {
@@ -179,9 +407,91 @@ mod tests {
             Op::Crop { x: 0.1, y: 0.1, w: 0.8, h: 0.8 },
             Op::Rotate { turns: 1 },
             Op::Saturation { value: -0.4 },
+            Op::Paint {
+                strokes: vec![Stroke {
+                    color: [220, 40, 40, 255],
+                    width: 0.02,
+                    erase: false,
+                    points: vec![0.1, 0.1, 0.5, 0.5],
+                }],
+            },
         ];
         let json = serde_json::to_string(&ops).unwrap();
         let back: Vec<Op> = serde_json::from_str(&json).unwrap();
         assert_eq!(ops, back);
+    }
+
+    fn white(w: u32, h: u32) -> RgbaImage {
+        RgbaImage::from_pixel(w, h, Rgba([255, 255, 255, 255]))
+    }
+
+    #[test]
+    fn a_stroke_marks_the_image() {
+        let mut img = white(64, 64);
+        let strokes = vec![Stroke {
+            color: [255, 0, 0, 255],
+            width: 0.1,
+            erase: false,
+            points: vec![0.2, 0.5, 0.8, 0.5],
+        }];
+        paint(&mut img, &strokes, &[], 64.0);
+        assert_eq!(img.get_pixel(32, 32).0[0..3], [255, 0, 0], "centre should be painted");
+        assert_eq!(img.get_pixel(2, 2).0[0..3], [255, 255, 255], "corner should be untouched");
+    }
+
+    #[test]
+    fn an_eraser_removes_paint_without_holing_the_photo() {
+        let mut img = white(64, 64);
+        let strokes = vec![
+            Stroke { color: [255, 0, 0, 255], width: 0.2, erase: false, points: vec![0.2, 0.5, 0.8, 0.5] },
+            Stroke { color: [0, 0, 0, 255], width: 0.5, erase: true, points: vec![0.2, 0.5, 0.8, 0.5] },
+        ];
+        paint(&mut img, &strokes, &[], 64.0);
+        let p = *img.get_pixel(32, 32);
+        assert_eq!(p.0[3], 255, "the photograph must stay opaque");
+        assert_eq!(p.0[0..3], [255, 255, 255], "the paint should be gone");
+    }
+
+    /// Paint is stored in source coordinates, so a stroke has to stay on the
+    /// same part of the subject after the frame is rotated.
+    #[test]
+    fn paint_follows_the_geometry() {
+        let stroke = Stroke {
+            color: [0, 0, 255, 255],
+            width: 0.3,
+            erase: false,
+            // A dot in the top-left quadrant. Two points so it is a segment.
+            points: vec![0.25, 0.25, 0.25, 0.25],
+        };
+
+        let mut plain = white(80, 80);
+        paint(&mut plain, std::slice::from_ref(&stroke), &[], 80.0);
+        assert_eq!(plain.get_pixel(20, 20).0[2], 255);
+
+        // One turn clockwise sends the top-left quadrant to the top-right.
+        let mut turned = white(80, 80);
+        paint(&mut turned, std::slice::from_ref(&stroke), &[Op::Rotate { turns: 1 }], 80.0);
+        assert_eq!(turned.get_pixel(60, 20).0[2], 255, "should follow the rotation");
+        assert_ne!(turned.get_pixel(20, 20).0[2], 255, "and leave its old position");
+    }
+
+    /// The same stroke must cover the same fraction of the frame whether it is
+    /// drawn on a preview or on a full-size export.
+    #[test]
+    fn strokes_scale_with_the_render_size() {
+        let stroke = Stroke {
+            color: [0, 0, 0, 255],
+            width: 0.25,
+            erase: false,
+            points: vec![0.5, 0.5, 0.5, 0.5],
+        };
+        let covered = |n: u32| {
+            let mut img = white(n, n);
+            paint(&mut img, std::slice::from_ref(&stroke), &[], n as f32);
+            img.pixels().filter(|p| p.0[0] < 128).count() as f32 / (n * n) as f32
+        };
+        let small = covered(100);
+        let large = covered(400);
+        assert!((small - large).abs() < 0.005, "coverage drifted: {small} vs {large}");
     }
 }

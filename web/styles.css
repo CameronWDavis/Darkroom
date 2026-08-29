@@ -22,6 +22,11 @@
 
 * { box-sizing: border-box; }
 
+/* The `hidden` attribute only works through a browser default rule, so any
+   author rule setting `display` beats it. Several elements here set display
+   for layout and are toggled with `hidden`, so restate it with weight. */
+[hidden] { display: none !important; }
+
 html, body {
   height: 100%;
   margin: 0;
@@ -202,7 +207,6 @@ input[type="range"]:focus-visible { outline: 2px solid var(--amber); outline-off
   background: var(--paper);
   box-shadow: 0 0 0 8px var(--paper), 0 18px 44px rgba(0,0,0,0.55);
 }
-#canvas[hidden] { display: none; }
 
 .stage-empty {
   position: absolute;
@@ -219,14 +223,45 @@ input[type="range"]:focus-visible { outline: 2px solid var(--amber); outline-off
 .stage.dragover { background: #1f1a10; }
 .stage.dragover .stage-empty { color: var(--amber); }
 
-.crop-layer { position: absolute; inset: 0; cursor: crosshair; background: rgba(10,8,4,0.62); }
+.crop-layer { position: absolute; inset: 0; cursor: crosshair; touch-action: none; }
+/* Only one element ever paints the mask: the box's spread shadow when there is
+   a selection, this pseudo-element when there isn't. Stacking both double-darkens. */
+.crop-layer.no-sel::before { content: ""; position: absolute; inset: 0; background: rgba(10,8,4,0.62); }
+
 .crop-box {
   position: absolute;
   border: 1px solid var(--amber);
   box-shadow: 0 0 0 9999px rgba(10,8,4,0.62);
   display: none;
+  cursor: move;
 }
 .crop-box.on { display: block; }
+
+.crop-box .grid {
+  position: absolute; inset: 0; pointer-events: none;
+  background:
+    linear-gradient(to right, transparent 33.33%, rgba(224,160,50,0.35) 33.33% calc(33.33% + 1px), transparent calc(33.33% + 1px) 66.66%, rgba(224,160,50,0.35) 66.66% calc(66.66% + 1px), transparent calc(66.66% + 1px)),
+    linear-gradient(to bottom, transparent 33.33%, rgba(224,160,50,0.35) 33.33% calc(33.33% + 1px), transparent calc(33.33% + 1px) 66.66%, rgba(224,160,50,0.35) 66.66% calc(66.66% + 1px), transparent calc(66.66% + 1px));
+}
+
+/* Handles are 11px visually but carry a 22px transparent hit area, because a
+   1px border is not a pointer target anyone can reliably hit. */
+.crop-box .h {
+  position: absolute;
+  width: 11px; height: 11px;
+  background: var(--amber);
+  border: 1px solid #1a1408;
+  box-sizing: border-box;
+}
+.crop-box .h::after { content: ""; position: absolute; inset: -6px; }
+.crop-box .h[data-h="nw"] { top: -6px; left: -6px; cursor: nwse-resize; }
+.crop-box .h[data-h="n"]  { top: -6px; left: 50%; margin-left: -5.5px; cursor: ns-resize; }
+.crop-box .h[data-h="ne"] { top: -6px; right: -6px; cursor: nesw-resize; }
+.crop-box .h[data-h="w"]  { top: 50%; left: -6px; margin-top: -5.5px; cursor: ew-resize; }
+.crop-box .h[data-h="e"]  { top: 50%; right: -6px; margin-top: -5.5px; cursor: ew-resize; }
+.crop-box .h[data-h="sw"] { bottom: -6px; left: -6px; cursor: nesw-resize; }
+.crop-box .h[data-h="s"]  { bottom: -6px; left: 50%; margin-left: -5.5px; cursor: ns-resize; }
+.crop-box .h[data-h="se"] { bottom: -6px; right: -6px; cursor: nwse-resize; }
 
 .crop-bar {
   position: absolute;
@@ -350,3 +385,173 @@ input[type="range"]:focus-visible { outline: 2px solid var(--amber); outline-off
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+
+/* ---------- history ---------- */
+
+.history { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-bottom: 18px; }
+
+/* ---------- crop bar additions ---------- */
+
+.inline { display: flex; align-items: center; gap: 7px; }
+.inline > span { font-size: 12.5px; color: var(--muted); }
+
+select {
+  padding: 5px 7px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  background: var(--raised);
+  color: var(--text);
+  font: inherit;
+  font-size: 12.5px;
+}
+select:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
+
+.crop-size {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--amber);
+  font-variant-numeric: tabular-nums;
+  min-width: 108px;
+}
+
+/* ---------- export sheet ---------- */
+
+.sheet {
+  width: 340px;
+  padding: 22px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--panel);
+  color: var(--text);
+  box-shadow: 0 24px 60px rgba(0,0,0,0.6);
+}
+.sheet::backdrop { background: rgba(8,6,3,0.7); }
+
+.sheet h2 {
+  margin: 0 0 20px;
+  font-family: var(--display);
+  font-size: 19px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  color: var(--paper);
+}
+
+.field { margin-bottom: 18px; }
+.field-label {
+  display: block;
+  margin-bottom: 8px;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.seg { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.seg .btn[aria-pressed="true"] {
+  background: var(--amber);
+  border-color: var(--amber);
+  color: #1a1408;
+  font-weight: 600;
+}
+
+.hint { margin: 8px 0 0; font-size: 11.5px; line-height: 1.5; color: var(--muted); min-height: 2.6em; }
+
+.readout {
+  margin: 0 0 20px;
+  padding: 11px 12px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  background: #100e0a;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.readout div { display: flex; justify-content: space-between; gap: 12px; }
+.readout div + div { margin-top: 5px; }
+.readout dt { color: var(--muted); }
+.readout dd { margin: 0; color: var(--amber); font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.sheet-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.sheet-actions .btn { padding: 8px 15px; }
+
+/* ---------- brush ---------- */
+
+.ink {
+  position: absolute;
+  left: 0; top: 0;
+  cursor: crosshair;
+  touch-action: none;
+}
+
+.paint-bar {
+  position: absolute;
+  bottom: 16px; left: 50%; transform: translateX(-50%);
+  display: flex; align-items: center; gap: 14px;
+  padding: 9px 12px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  background: var(--panel);
+  box-shadow: 0 10px 26px rgba(0,0,0,0.5);
+}
+.paint-bar input[type="range"] { width: 92px; }
+
+.swatch {
+  width: 30px; height: 30px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  cursor: pointer;
+  padding: 0;
+  /* Checkerboard shows through when the colour is partly transparent. */
+  background-image:
+    linear-gradient(45deg, #3a352b 25%, transparent 25%, transparent 75%, #3a352b 75%),
+    linear-gradient(45deg, #3a352b 25%, transparent 25%, transparent 75%, #3a352b 75%);
+  background-size: 10px 10px;
+  background-position: 0 0, 5px 5px;
+  position: relative;
+}
+.swatch::after {
+  content: ""; position: absolute; inset: 2px; border-radius: 2px;
+  background: var(--sw, #e0a032);
+}
+.swatch:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
+
+#btn-eraser[aria-pressed="true"] {
+  background: var(--amber); border-color: var(--amber); color: #1a1408; font-weight: 600;
+}
+
+.wheel-pop {
+  position: absolute;
+  bottom: calc(100% + 10px);
+  left: 0;
+  width: 200px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--panel);
+  box-shadow: 0 16px 40px rgba(0,0,0,0.6);
+}
+#wheel { display: block; cursor: crosshair; touch-action: none; border-radius: 50%; }
+
+.inline.vert { display: block; margin-top: 12px; }
+.inline.vert > span {
+  display: block; margin-bottom: 5px;
+  font-family: var(--mono); font-size: 9.5px;
+  letter-spacing: 0.13em; text-transform: uppercase;
+}
+.inline.vert input[type="range"] { width: 100%; }
+
+.swatches { display: grid; grid-template-columns: repeat(8, 1fr); gap: 4px; margin-top: 12px; }
+.swatches button {
+  aspect-ratio: 1; border: 1px solid var(--line); border-radius: 2px;
+  padding: 0; cursor: pointer;
+}
+.swatches button:focus-visible { outline: 2px solid var(--amber); outline-offset: 1px; }
+
+.hex {
+  width: 100%; margin-top: 10px; padding: 6px 8px;
+  border: 1px solid var(--line); border-radius: 3px;
+  background: #100e0a; color: var(--amber);
+  font-family: var(--mono); font-size: 12px;
+  text-align: center; letter-spacing: 0.06em;
+}
+.hex:focus-visible { outline: 2px solid var(--amber); outline-offset: 1px; }
