@@ -48,6 +48,11 @@ pub enum Op {
     /// Always last in the array, so paint sits on top of tone adjustments
     /// rather than being desaturated along with the photograph.
     Paint { strokes: Vec<Stroke> },
+    /// Free-form cut-out. Flat x,y pairs in normalized source coordinates,
+    /// implicitly closed. Crops to the shape's bounding box and clears alpha
+    /// outside the shape, so this is the one op that can introduce
+    /// transparency into an otherwise opaque photograph.
+    Lasso { points: Vec<f32> },
 }
 
 fn is_geometry(op: &Op) -> bool {
@@ -65,13 +70,25 @@ pub fn apply_all(src: &RgbaImage, ops: &[Op]) -> RgbaImage {
     let mut img = src.clone();
     let mut geo: Vec<Op> = Vec::new();
     for op in ops {
-        if let Op::Paint { strokes } = op {
-            paint(&mut img, strokes, &geo, base_short);
-        } else {
-            if is_geometry(op) {
-                geo.push(op.clone());
+        match op {
+            Op::Paint { strokes } => paint(&mut img, strokes, &geo, base_short),
+            Op::Lasso { points } => {
+                // A lasso shifts the frame just as a crop does, so anything
+                // applied afterwards has to be mapped through it. Recording
+                // the resulting bounding box as an equivalent Crop lets
+                // map_point stay ignorant of lassos entirely.
+                let pre = (img.width(), img.height());
+                if let Some(bb) = lasso_bbox(points, &geo, pre.0, pre.1) {
+                    img = cut_out(&img, points, &geo, bb);
+                    geo.push(bbox_as_crop(bb, pre));
+                }
             }
-            img = apply_one(img, op);
+            _ => {
+                if is_geometry(op) {
+                    geo.push(op.clone());
+                }
+                img = apply_one(img, op);
+            }
         }
     }
     img
@@ -134,8 +151,8 @@ fn apply_one(img: RgbaImage, op: &Op) -> RgbaImage {
                 imageops::blur(&img, sigma)
             }
         }
-        // Handled in apply_all, which has the geometry context this needs.
-        Op::Paint { .. } => img,
+        // Both handled in apply_all, which has the geometry context they need.
+        Op::Paint { .. } | Op::Lasso { .. } => img,
     }
 }
 
@@ -154,6 +171,145 @@ fn crop_normalized(img: &RgbaImage, x: f32, y: f32, w: f32, h: f32) -> RgbaImage
     let pw = ((w.clamp(0.0, 1.0) * iw as f32).round() as u32).clamp(1, iw - px);
     let ph = ((h.clamp(0.0, 1.0) * ih as f32).round() as u32).clamp(1, ih - py);
     imageops::crop_imm(img, px, py, pw, ph).to_image()
+}
+
+// --- lasso -----------------------------------------------------------------
+
+/// Pixel-space bounding box of the shape, mapped through prior geometry.
+fn lasso_bbox(points: &[f32], geo: &[Op], w: u32, h: u32) -> Option<(u32, u32, u32, u32)> {
+    let pts = mapped_points(points, geo, w, h);
+    if pts.len() < 3 {
+        return None;
+    }
+    let x0 = pts.iter().map(|p| p.0).fold(f32::MAX, f32::min).floor().max(0.0) as u32;
+    let y0 = pts.iter().map(|p| p.1).fold(f32::MAX, f32::min).floor().max(0.0) as u32;
+    let x1 = (pts.iter().map(|p| p.0).fold(f32::MIN, f32::max).ceil().min(w as f32) as u32).max(x0 + 1);
+    let y1 = (pts.iter().map(|p| p.1).fold(f32::MIN, f32::max).ceil().min(h as f32) as u32).max(y0 + 1);
+    if x0 >= w || y0 >= h {
+        return None;
+    }
+    Some((x0, y0, (x1 - x0).min(w - x0), (y1 - y0).min(h - y0)))
+}
+
+fn bbox_as_crop(bb: (u32, u32, u32, u32), dims: (u32, u32)) -> Op {
+    let (w, h) = (dims.0.max(1) as f32, dims.1.max(1) as f32);
+    Op::Crop { x: bb.0 as f32 / w, y: bb.1 as f32 / h, w: bb.2 as f32 / w, h: bb.3 as f32 / h }
+}
+
+fn mapped_points(points: &[f32], geo: &[Op], w: u32, h: u32) -> Vec<(f32, f32)> {
+    points
+        .chunks_exact(2)
+        .map(|c| {
+            let (nx, ny) = map_point(c[0], c[1], geo);
+            (nx * w as f32, ny * h as f32)
+        })
+        .collect()
+}
+
+/// Vertical subsamples per output row. Four is enough to hide the stair-step
+/// on a near-horizontal edge without the cost showing up.
+const SUBSAMPLES: usize = 4;
+
+fn cut_out(img: &RgbaImage, points: &[f32], geo: &[Op], bb: (u32, u32, u32, u32)) -> RgbaImage {
+    let pts = mapped_points(points, geo, img.width(), img.height());
+    let (bx, by, bw, bh) = bb;
+    let (bw_i, bh_i) = (bw as usize, bh as usize);
+
+    // Testing each pixel against every edge would be O(edges) per pixel, which
+    // does not survive a large export. Scanline conversion is O(edges) per row
+    // and gives exact horizontal coverage for free.
+    let mut cov = vec![0.0f32; bw_i * bh_i];
+    let weight = 1.0 / SUBSAMPLES as f32;
+    let mut xs: Vec<f32> = Vec::with_capacity(pts.len());
+
+    for row in 0..bh_i {
+        for s in 0..SUBSAMPLES {
+            let y = by as f32 + row as f32 + (s as f32 + 0.5) / SUBSAMPLES as f32;
+            xs.clear();
+            for i in 0..pts.len() {
+                let a = pts[i];
+                let b = pts[(i + 1) % pts.len()];
+                // Half-open comparison, so a vertex exactly on the scanline is
+                // counted once rather than zero or twice.
+                if (a.1 <= y) != (b.1 <= y) {
+                    let t = (y - a.1) / (b.1 - a.1);
+                    xs.push(a.0 + t * (b.0 - a.0));
+                }
+            }
+            xs.sort_by(|p, q| p.partial_cmp(q).unwrap_or(std::cmp::Ordering::Equal));
+            // Even-odd rule: fill between alternating pairs, which handles a
+            // self-crossing lasso the way a person would expect.
+            for pair in xs.chunks_exact(2) {
+                add_span(&mut cov, bw_i, row, pair[0] - bx as f32, pair[1] - bx as f32, weight);
+            }
+        }
+    }
+
+    let mut out = RgbaImage::new(bw, bh);
+    for y in 0..bh {
+        for x in 0..bw {
+            let c = cov[y as usize * bw_i + x as usize].clamp(0.0, 1.0);
+            if c <= 0.0 {
+                continue;
+            }
+            let mut p = *img.get_pixel(x + bx, y + by);
+            p[3] = clamp8(p[3] as f32 * c);
+            out.put_pixel(x, y, p);
+        }
+    }
+    out
+}
+
+fn add_span(cov: &mut [f32], w: usize, row: usize, x0: f32, x1: f32, weight: f32) {
+    let a = x0.max(0.0);
+    let b = x1.min(w as f32);
+    if b <= a {
+        return;
+    }
+    let ia = a.floor() as usize;
+    let ib = (b.ceil() as usize).min(w);
+    for i in ia..ib {
+        // Partial coverage at each end of the span, full in between.
+        let l = (i as f32).max(a);
+        let r = ((i + 1) as f32).min(b);
+        if r > l {
+            cov[row * w + i] += (r - l) * weight;
+        }
+    }
+}
+
+/// Output dimensions without doing the work. One source of truth for the
+/// export dialog, replacing a duplicate of the crop maths in app.js.
+pub fn dims_after(w: u32, h: u32, ops: &[Op]) -> (u32, u32) {
+    let (mut cw, mut ch) = (w.max(1), h.max(1));
+    let mut geo: Vec<Op> = Vec::new();
+    for op in ops {
+        match op {
+            Op::Crop { .. } => {
+                let probe = RgbaImage::new(cw, ch);
+                let d = apply_one(probe, op).dimensions();
+                cw = d.0;
+                ch = d.1;
+                geo.push(op.clone());
+            }
+            Op::Rotate { turns } => {
+                if turns % 2 == 1 {
+                    std::mem::swap(&mut cw, &mut ch);
+                }
+                geo.push(op.clone());
+            }
+            Op::FlipH | Op::FlipV => geo.push(op.clone()),
+            Op::Lasso { points } => {
+                if let Some(bb) = lasso_bbox(points, &geo, cw, ch) {
+                    geo.push(bbox_as_crop(bb, (cw, ch)));
+                    cw = bb.2;
+                    ch = bb.3;
+                }
+            }
+            _ => {}
+        }
+    }
+    (cw, ch)
 }
 
 // --- painting --------------------------------------------------------------
@@ -493,5 +649,81 @@ mod tests {
         let small = covered(100);
         let large = covered(400);
         assert!((small - large).abs() < 0.005, "coverage drifted: {small} vs {large}");
+    }
+
+    fn diamond() -> Vec<f32> {
+        // A diamond inscribed in the middle half of the frame.
+        vec![0.5, 0.25, 0.75, 0.5, 0.5, 0.75, 0.25, 0.5]
+    }
+
+    #[test]
+    fn a_lasso_crops_to_its_bounding_box() {
+        let img = white(200, 200);
+        let out = apply_all(&img, &[Op::Lasso { points: diamond() }]);
+        assert_eq!(out.dimensions(), (100, 100), "should crop to the diamond's box");
+    }
+
+    #[test]
+    fn a_lasso_clears_alpha_outside_the_shape() {
+        let img = white(200, 200);
+        let out = apply_all(&img, &[Op::Lasso { points: diamond() }]);
+        assert_eq!(out.get_pixel(50, 50).0[3], 255, "centre stays opaque");
+        assert_eq!(out.get_pixel(1, 1).0[3], 0, "corner outside the diamond is cleared");
+        assert_eq!(out.get_pixel(98, 1).0[3], 0, "and the opposite corner too");
+    }
+
+    #[test]
+    fn lasso_coverage_is_resolution_independent() {
+        // The diamond occupies half of its bounding box at any render size.
+        let frac = |n: u32| {
+            let out = apply_all(&white(n, n), &[Op::Lasso { points: diamond() }]);
+            let total = (out.width() * out.height()) as f32;
+            out.pixels().filter(|p| p.0[3] > 127).count() as f32 / total
+        };
+        for n in [120u32, 400, 900] {
+            let f = frac(n);
+            assert!((f - 0.5).abs() < 0.02, "at {n}px coverage was {f}, expected ~0.5");
+        }
+    }
+
+    #[test]
+    fn dims_after_agrees_with_actually_rendering() {
+        let cases: Vec<Vec<Op>> = vec![
+            vec![],
+            vec![Op::Crop { x: 0.1, y: 0.2, w: 0.5, h: 0.6 }],
+            vec![Op::Rotate { turns: 1 }],
+            vec![Op::Lasso { points: diamond() }],
+            vec![Op::Crop { x: 0.1, y: 0.1, w: 0.8, h: 0.8 }, Op::Rotate { turns: 3 }],
+            vec![Op::Lasso { points: diamond() }, Op::Rotate { turns: 1 }],
+            vec![Op::Crop { x: 0.2, y: 0.0, w: 0.6, h: 1.0 }, Op::Lasso { points: diamond() }],
+        ];
+        for ops in cases {
+            let img = white(240, 180);
+            assert_eq!(
+                dims_after(240, 180, &ops),
+                apply_all(&img, &ops).dimensions(),
+                "prediction diverged for {ops:?}"
+            );
+        }
+    }
+
+    /// Paint applied after a lasso has to land in the same place on the
+    /// subject, because the lasso moved the frame under it.
+    #[test]
+    fn paint_survives_a_lasso() {
+        let dot = Stroke {
+            color: [0, 0, 255, 255],
+            width: 0.06,
+            erase: false,
+            // Dead centre of the source, which is inside the diamond.
+            points: vec![0.5, 0.5, 0.5, 0.5],
+        };
+        let ops = vec![
+            Op::Lasso { points: diamond() },
+            Op::Paint { strokes: vec![dot] },
+        ];
+        let out = apply_all(&white(200, 200), &ops);
+        assert_eq!(out.dimensions(), (100, 100));
+        assert_eq!(out.get_pixel(50, 50).0[2], 255, "the dot should be centred after the cut");
     }
 }

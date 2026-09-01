@@ -22,7 +22,11 @@ fn err(e: impl Into<String>) -> JsValue {
 pub struct Editor {
     layers: Vec<Layer>,
     next_id: u32,
+    /// Last rendered preview. JS reads this directly out of wasm memory.
     preview: RgbaImage,
+    /// Downscaled source, keyed by (layer id, requested max edge). Rescaling a
+    /// 24MP source on every slider tick is what makes naive versions of this
+    /// feel broken, so we pay for it once per image.
     scaled: Option<(String, u32, RgbaImage)>,
 }
 
@@ -55,6 +59,7 @@ impl Editor {
             ops: Vec::new(),
             decoded: None,
         };
+        // Decode eagerly so a corrupt file fails at import, not three clicks later.
         layer.decode().map_err(err)?;
         self.layers.push(layer);
         Ok(id)
@@ -150,6 +155,15 @@ impl Editor {
         let stem = l.name.rsplit_once('.').map(|(s, _)| s).unwrap_or(&l.name);
         let ext = if format == "png" { "png" } else { "jpg" };
         Ok(format!("{stem}-edited.{ext}"))
+    }
+
+    /// `"WIDTHxHEIGHT"` for the current ops, computed without rendering.
+    /// Lives here so the crop and lasso maths have exactly one home.
+    pub fn output_dims(&mut self, id: &str) -> Result<String, JsValue> {
+        let (w, h) = self.layer_mut(id)?.decode().map_err(err)?.dimensions();
+        let ops = self.layer(id)?.ops.clone();
+        let (ow, oh) = ops::dims_after(w, h, &ops);
+        Ok(format!("{ow}x{oh}"))
     }
 
     pub fn save_bundle(&self) -> Result<Vec<u8>, JsValue> {

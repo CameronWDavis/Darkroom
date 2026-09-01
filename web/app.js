@@ -29,7 +29,7 @@ const blank = () => ({
   crop: null, turns: 0, flipH: false, flipV: false,
   brightness: 0, contrast: 0, saturation: 0,
   grayscale: false, invert: false, blur: 0,
-  strokes: [],
+  strokes: [], lasso: null,
 });
 
 // --- ops translation -------------------------------------------------------
@@ -40,6 +40,7 @@ function buildOps(a, { skipGeometry = false } = {}) {
   const ops = [];
   if (!skipGeometry) {
     if (a.crop) ops.push({ op: "crop", ...a.crop });
+    if (a.lasso) ops.push({ op: "lasso", points: a.lasso });
     if (a.turns % 4) ops.push({ op: "rotate", turns: a.turns % 4 });
     if (a.flipH) ops.push({ op: "flip_h" });
     if (a.flipV) ops.push({ op: "flip_v" });
@@ -71,24 +72,10 @@ function parseOps(ops) {
       case "invert": a.invert = true; break;
       case "blur": a.blur = Math.round(o.amount * 100); break;
       case "paint": a.strokes = o.strokes || []; break;
+      case "lasso": a.lasso = o.points || null; break;
     }
   }
   return a;
-}
-
-/** Mirrors crop_normalized() in src/ops.rs so the export dialog can predict
- *  output dimensions without a round trip. Keep the two in step. */
-function outputSize(l, a) {
-  let w = l.width, h = l.height;
-  if (a.crop) {
-    const px = Math.min(Math.round(a.crop.x * w), w - 1);
-    const py = Math.min(Math.round(a.crop.y * h), h - 1);
-    const cw = clamp(Math.round(a.crop.w * w), 1, w - px);
-    const ch = clamp(Math.round(a.crop.h * h), 1, h - py);
-    w = cw; h = ch;
-  }
-  if (a.turns % 2) { const t = w; w = h; h = t; }
-  return { w, h };
 }
 
 // --- history ---------------------------------------------------------------
@@ -101,6 +88,7 @@ const snap = (a) => ({
   ...a,
   crop: a.crop ? { ...a.crop } : null,
   strokes: a.strokes.map((s) => ({ ...s, points: s.points.slice() })),
+  lasso: a.lasso ? a.lasso.slice() : null,
 });
 
 function hist(id) {
@@ -174,6 +162,7 @@ function draw() {
 
   if (cropping) requestAnimationFrame(paintCrop);
   if (painting) requestAnimationFrame(syncInk);
+  if (lassoing) requestAnimationFrame(() => { syncInk(); drawLasso(); });
 }
 
 function previewCap() {
@@ -251,6 +240,7 @@ function renderStrip() {
 function selectLayer(id) {
   if (cropping) exitCrop();
   if (painting) exitPaint();
+  if (lassoing) exitLasso();
   activeId = id;
   if (!adjust.has(id)) adjust.set(id, blank());
   syncControls();
@@ -268,6 +258,7 @@ function removeLayer(id) {
   if (activeId === id) {
     if (cropping) exitCrop();
     if (painting) exitPaint();
+    if (lassoing) exitLasso();
     const rest = layers.filter((l) => l.id !== id);
     activeId = rest.length ? rest[0].id : null;
   }
@@ -290,6 +281,7 @@ function syncControls() {
   $("c-invert").checked = a.invert;
   $("btn-uncrop").hidden = !a.crop;
   $("btn-clear-ink").hidden = !a.strokes.length;
+  $("btn-unlasso").hidden = !a.lasso;
 }
 
 function edit(fn) {
@@ -504,6 +496,7 @@ $("btn-crop-apply").addEventListener("click", () => {
 function enterCrop() {
   if (!activeId) return;
   if (painting) exitPaint();
+  if (lassoing) exitLasso();
   cropping = true;
   pendingCrop = adjust.get(activeId).crop;
   $("crop-layer").hidden = false;
@@ -524,6 +517,219 @@ function exitCrop() {
 }
 
 
+
+// --- scissors --------------------------------------------------------------
+
+let lassoing = false;
+let lassoPts = [];       // flat x,y pairs in source coordinates
+let lassoHover = null;   // cursor position for the rubber band, in ink pixels
+let lassoDrag = null;
+
+const CLOSE_PX = 12;     // how near the first point counts as closing the shape
+// A click is never perfectly still. Below this much travel it stays a click,
+// so placing single vertices actually works with a real mouse.
+const DRAG_PX = 10;
+
+function enterLasso() {
+  if (!activeId) return;
+  if (cropping) exitCrop();
+  if (painting) exitPaint();
+  lassoing = true;
+  lassoPts = [];
+  lassoHover = null;
+  $("lasso-bar").hidden = false;
+  $("ink").hidden = false;
+  $("btn-lasso").textContent = "Close scissors";
+  requestAnimationFrame(() => { syncInk(); drawLasso(); });
+}
+
+function exitLasso() {
+  lassoing = false;
+  lassoPts = [];
+  lassoHover = null;
+  lassoDrag = null;
+  $("lasso-bar").hidden = true;
+  $("ink").hidden = true;
+  $("btn-lasso").textContent = "Scissors";
+  const ink = $("ink");
+  ink.getContext("2d").clearRect(0, 0, ink.width, ink.height);
+}
+
+/** Source coordinates back to a position on the overlay, for drawing. */
+function sourceToInk(sx, sy, a) {
+  let x = sx, y = sy;
+  if (a.crop) { x = (x - a.crop.x) / a.crop.w; y = (y - a.crop.y) / a.crop.h; }
+  if (a.lasso) {
+    const b = lassoBounds(a.lasso);
+    x = (x - b.x) / b.w; y = (y - b.y) / b.h;
+  }
+  const t = a.turns % 4;
+  if (t === 1) { const u = x; x = 1 - y; y = u; }
+  else if (t === 2) { x = 1 - x; y = 1 - y; }
+  else if (t === 3) { const u = x; x = y; y = 1 - u; }
+  if (a.flipH) x = 1 - x;
+  if (a.flipV) y = 1 - y;
+  const ink = $("ink");
+  return [x * ink.width, y * ink.height];
+}
+
+function drawLasso() {
+  const ink = $("ink"), ctx = ink.getContext("2d");
+  ctx.clearRect(0, 0, ink.width, ink.height);
+  if (!activeId) return;
+  const a = adjust.get(activeId);
+  const pts = [];
+  for (let i = 0; i < lassoPts.length; i += 2) {
+    pts.push(sourceToInk(lassoPts[i], lassoPts[i + 1], a));
+  }
+
+  const n = pts.length;
+  $("btn-lasso-apply").disabled = n < 3;
+  $("btn-lasso-undo").disabled = n === 0;
+  const hint = $("lasso-hint");
+  hint.classList.toggle("ready", n >= 3);
+  hint.textContent = n === 0
+    ? "Click to place points, or drag to draw freehand"
+    : n < 3
+      ? `${n} point${n > 1 ? "s" : ""} — at least 3 needed`
+      : `${n} points — right-click, or click the first point, to cut`;
+
+  if (!n) return;
+
+  const path = new Path2D();
+  path.moveTo(pts[0][0], pts[0][1]);
+  for (let i = 1; i < n; i++) path.lineTo(pts[i][0], pts[i][1]);
+  if (lassoHover && !lassoDrag) path.lineTo(lassoHover[0], lassoHover[1]);
+  path.closePath();
+
+  // Dim everything that would be discarded. Even-odd against a full-canvas
+  // rect leaves the interior of the shape untouched.
+  if (n >= 3) {
+    const outside = new Path2D();
+    outside.rect(0, 0, ink.width, ink.height);
+    outside.addPath(path);
+    ctx.fillStyle = "rgba(10,8,4,0.62)";
+    ctx.fill(outside, "evenodd");
+  }
+
+  ctx.strokeStyle = "#e0a032";
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash([5, 4]);
+  ctx.stroke(path);
+  ctx.setLineDash([]);
+
+  for (let i = 0; i < n; i++) {
+    ctx.beginPath();
+    ctx.arc(pts[i][0], pts[i][1], i === 0 ? 5 : 3.5, 0, Math.PI * 2);
+    ctx.fillStyle = i === 0 ? "#e0a032" : "#14120e";
+    ctx.strokeStyle = "#e0a032";
+    ctx.lineWidth = 1.5;
+    ctx.fill();
+    ctx.stroke();
+  }
+}
+
+function addLassoPoint(e) {
+  const ink = $("ink"), r = ink.getBoundingClientRect();
+  const nx = (e.clientX - r.left) / r.width;
+  const ny = (e.clientY - r.top) / r.height;
+  const [sx, sy] = screenToSource(nx, ny, adjust.get(activeId));
+  lassoPts.push(sx, sy);
+}
+
+/** True when the pointer is back on the first vertex. */
+function overFirstPoint(e) {
+  if (lassoPts.length < 6) return false;
+  const ink = $("ink"), r = ink.getBoundingClientRect();
+  const [fx, fy] = sourceToInk(lassoPts[0], lassoPts[1], adjust.get(activeId));
+  const scale = ink.width / r.width;
+  return Math.hypot((e.clientX - r.left) * scale - fx, (e.clientY - r.top) * scale - fy) < CLOSE_PX * scale;
+}
+
+function applyLasso() {
+  if (lassoPts.length < 6) return;
+  const pts = lassoPts.slice();
+  pushHistory();
+  const a = adjust.get(activeId);
+  // Points are captured in source space, but any earlier lasso already
+  // reframed the image. Committing a second cut on top would need the points
+  // re-expressed against the first, so replace rather than compose.
+  a.lasso = pts;
+  exitLasso();
+  syncControls();
+  scheduleRender();
+  requestAnimationFrame(refreshLayers);
+}
+
+$("btn-lasso").addEventListener("click", () => (lassoing ? exitLasso() : enterLasso()));
+$("btn-lasso-cancel").addEventListener("click", exitLasso);
+$("btn-lasso-apply").addEventListener("click", applyLasso);
+$("btn-lasso-undo").addEventListener("click", () => {
+  lassoPts.splice(-2, 2);
+  drawLasso();
+});
+$("btn-unlasso").addEventListener("click", () => {
+  edit((a) => (a.lasso = null));
+  syncControls();
+});
+
+(() => {
+  const ink = $("ink");
+  let downAt = null;
+
+  ink.addEventListener("pointerdown", (e) => {
+    // Right-click is reserved for finishing the shape, so it must not also
+    // drop a vertex on the way through.
+    if (!lassoing || !activeId || e.button !== 0) return;
+    ink.setPointerCapture(e.pointerId);
+    downAt = [e.clientX, e.clientY];
+    lassoDrag = null;
+    e.preventDefault();
+  });
+
+  ink.addEventListener("pointermove", (e) => {
+    if (!lassoing) return;
+    const r = ink.getBoundingClientRect();
+    const scale = ink.width / r.width;
+    lassoHover = [(e.clientX - r.left) * scale, (e.clientY - r.top) * scale];
+
+    if (downAt) {
+      // A press that travels turns into a freehand trace; a press that does
+      // not is a single placed vertex. One tool, both interaction styles.
+      const moved = Math.hypot(e.clientX - downAt[0], e.clientY - downAt[1]);
+      if (!lassoDrag && moved > DRAG_PX) lassoDrag = [e.clientX, e.clientY];
+      if (lassoDrag) {
+        if (Math.hypot(e.clientX - lassoDrag[0], e.clientY - lassoDrag[1]) >= 3) {
+          addLassoPoint(e);
+          lassoDrag = [e.clientX, e.clientY];
+        }
+      }
+    }
+    drawLasso();
+  });
+
+  ink.addEventListener("contextmenu", (e) => {
+    if (!lassoing) return;
+    e.preventDefault();
+    // Right-click closes the shape and cuts, the way polygon lasso tools have
+    // always worked. Enter does the same for keyboard users.
+    if (lassoPts.length >= 6) applyLasso();
+  });
+
+  for (const t of ["pointerup", "pointercancel"]) {
+    ink.addEventListener(t, (e) => {
+      if (!lassoing || !downAt) return;
+      const wasDrag = !!lassoDrag;
+      downAt = null;
+      lassoDrag = null;
+      if (wasDrag) { drawLasso(); return; }
+      if (overFirstPoint(e)) { applyLasso(); return; }
+      addLassoPoint(e);
+      drawLasso();
+    });
+  }
+})();
+
 // --- painting --------------------------------------------------------------
 
 let painting = false;
@@ -542,8 +748,25 @@ function screenToSource(nx, ny, a) {
   if (t === 1) { const u = x; x = y; y = 1 - u; }
   else if (t === 2) { x = 1 - x; y = 1 - y; }
   else if (t === 3) { const u = x; x = 1 - y; y = u; }
+  // A lasso reframes the image to its bounding box, so undo that before the
+  // rectangular crop -- the reverse of the order buildOps emits them in.
+  if (a.lasso) {
+    const b = lassoBounds(a.lasso);
+    x = x * b.w + b.x;
+    y = y * b.h + b.y;
+  }
   if (a.crop) { x = x * a.crop.w + a.crop.x; y = y * a.crop.h + a.crop.y; }
   return [x, y];
+}
+
+/** Bounding box of a flat point list, in the same normalized space. */
+function lassoBounds(pts) {
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (let i = 0; i < pts.length; i += 2) {
+    x0 = Math.min(x0, pts[i]); x1 = Math.max(x1, pts[i]);
+    y0 = Math.min(y0, pts[i + 1]); y1 = Math.max(y1, pts[i + 1]);
+  }
+  return { x: x0, y: y0, w: Math.max(x1 - x0, 1e-6), h: Math.max(y1 - y0, 1e-6) };
 }
 
 /** Brush width is a fraction of the source short edge, but the live overlay
@@ -657,6 +880,7 @@ function syncInk() {
 function enterPaint() {
   if (!activeId) return;
   if (cropping) exitCrop();
+  if (lassoing) exitLasso();
   painting = true;
   $("paint-bar").hidden = false;
   $("ink").hidden = false;
@@ -726,7 +950,10 @@ $("hex").addEventListener("change", (e) => {
   };
 
   ink.addEventListener("pointerdown", (e) => {
-    if (!activeId) return;
+    // Both tools share this overlay, so each has to check it owns the pointer.
+    // Without this the brush also fires during a scissors click and commits a
+    // one-point stroke, which renders as a stray dot.
+    if (!painting || !activeId || e.button !== 0) return;
     ink.setPointerCapture(e.pointerId);
     const [rgb, a] = [brushRgb(), adjust.get(activeId)];
     inkStroke = {
@@ -742,7 +969,7 @@ $("hex").addEventListener("change", (e) => {
   });
 
   ink.addEventListener("pointermove", (e) => {
-    if (!inkStroke) return;
+    if (!painting || !inkStroke) return;
     const p = at(e);
     // Thin out the point list: anything closer than a couple of pixels adds
     // bytes to the project file without changing the visible line.
@@ -828,8 +1055,10 @@ function syncExport() {
   const l = layers.find((x) => x.id === activeId);
   const a = adjust.get(activeId);
   if (!l || !a) return;
-  const s = outputSize(l, a);
-  $("x-size").textContent = `${s.w} × ${s.h} px`;
+  try {
+    const [w, h] = ed.output_dims(activeId).split("x");
+    $("x-size").textContent = `${w} × ${h} px`;
+  } catch { $("x-size").textContent = "–"; }
   try { $("x-name").textContent = ed.export_name(activeId, exportFmt); } catch {}
 }
 
@@ -975,6 +1204,10 @@ stage.addEventListener("drop", async (e) => {
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && cropping) { exitCrop(); return; }
   if (e.key === "Escape" && painting) { exitPaint(); return; }
+  if (lassoing) {
+    if (e.key === "Escape") { exitLasso(); return; }
+    if (e.key === "Enter") { applyLasso(); return; }
+  }
   if ($("export-dialog").open) return;
   if (!(e.ctrlKey || e.metaKey)) return;
   const k = e.key.toLowerCase();
@@ -1027,6 +1260,7 @@ window.addEventListener("resize", () => {
   if (activeId) scheduleRender();
   if (cropping) paintCrop();
   if (painting) syncInk();
+  if (lassoing) { syncInk(); drawLasso(); }
 });
 
 // Best-effort scrub on unload. The tab teardown does the real work.

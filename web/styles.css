@@ -555,3 +555,23 @@ select:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
   text-align: center; letter-spacing: 0.06em;
 }
 .hex:focus-visible { outline: 2px solid var(--amber); outline-offset: 1px; }
+
+/* ---------- scissors ---------- */
+
+.lasso-bar {
+  position: absolute;
+  bottom: 16px; left: 50%; transform: translateX(-50%);
+  display: flex; align-items: center; gap: 12px;
+  padding: 9px 12px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  background: var(--panel);
+  box-shadow: 0 10px 26px rgba(0,0,0,0.5);
+}
+.lasso-hint {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--muted);
+  min-width: 240px;
+}
+.lasso-hint.ready { color: var(--amber); }
