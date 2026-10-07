@@ -1,0 +1,82 @@
+name: Build website and publish Pages
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish this build to GitHub Pages
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Rust
+        run: |
+          rustup toolchain install stable --profile minimal --target wasm32-unknown-unknown
+          rustup default stable
+
+      - name: Check image engine and JavaScript
+        run: |
+          cargo test --locked
+          node --input-type=module --check < web/app.js
+          node --input-type=module --check < web/video.js
+
+      - name: Build browser image engine
+        run: |
+          cargo build --locked --release --target wasm32-unknown-unknown
+          bindgen_version=$(python3 -c 'import tomllib; lock = tomllib.load(open("Cargo.lock", "rb")); print(next(p["version"] for p in lock["package"] if p["name"] == "wasm-bindgen"))')
+          cargo install wasm-bindgen-cli --version "$bindgen_version" --locked
+          wasm-bindgen --target web --out-dir web/pkg target/wasm32-unknown-unknown/release/darkroom.wasm
+          test -s web/index.html
+          test -s web/pkg/darkroom.js
+          test -s web/pkg/darkroom_bg.wasm
+
+      - name: Upload downloadable website
+        uses: actions/upload-artifact@v7
+        with:
+          name: darkroom-web
+          path: web/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Prepare Pages artifact
+        if: github.event_name == 'workflow_dispatch' && inputs.publish && github.ref == 'refs/heads/main'
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: web/
+
+  deploy:
+    if: github.event_name == 'workflow_dispatch' && inputs.publish && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    concurrency:
+      group: github-pages
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+      - name: Publish website
+        id: deployment
+        uses: actions/deploy-pages@v4

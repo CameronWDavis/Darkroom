@@ -41,6 +41,9 @@ pub enum Op {
     Contrast { value: f32 },
     /// -1.0 .. 1.0, where -1.0 is fully desaturated.
     Saturation { value: f32 },
+    Exposure { value: f32 },
+    Warmth { value: f32 },
+    Sharpen { value: f32 },
     Grayscale,
     Invert,
     /// 0.0 .. 1.0 as a fraction of the short edge.
@@ -136,6 +139,26 @@ fn apply_one(img: RgbaImage, op: &Op) -> RgbaImage {
                     c[3],
                 ]
             })
+        }
+        Op::Exposure { value } => {
+            let gain = 2.0f32.powf(value.clamp(-1.0, 1.0) * 2.0);
+            per_pixel(img, |c| [clamp8(c[0] as f32 * gain), clamp8(c[1] as f32 * gain), clamp8(c[2] as f32 * gain), c[3]])
+        }
+        Op::Warmth { value } => {
+            let shift = value.clamp(-1.0, 1.0) * 40.0;
+            per_pixel(img, |c| [clamp8(c[0] as f32 + shift), c[1], clamp8(c[2] as f32 - shift), c[3]])
+        }
+        Op::Sharpen { value } => {
+            let amount = value.clamp(0.0, 1.0) * 2.0;
+            let radius = (img.width().min(img.height()) as f32 * 0.001).max(0.5);
+            let soft = imageops::blur(&img, radius);
+            let mut result = img.clone();
+            for ((out, original), blurred) in result.pixels_mut().zip(img.pixels()).zip(soft.pixels()) {
+                for channel in 0..3 {
+                    out[channel] = clamp8(original[channel] as f32 + amount * (original[channel] as f32 - blurred[channel] as f32));
+                }
+            }
+            result
         }
         Op::Grayscale => per_pixel(img, |c| {
             let l = clamp8(luma(c));
@@ -525,6 +548,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn exposure_and_temperature_preserve_alpha() {
+        let pixel = RgbaImage::from_pixel(1, 1, Rgba([80, 100, 120, 77]));
+        let exposed = apply_all(&pixel, &[Op::Exposure { value: 0.5 }]);
+        assert_eq!(exposed.get_pixel(0, 0).0, [160, 200, 240, 77]);
+        let warm = apply_all(&pixel, &[Op::Warmth { value: 0.5 }]);
+        assert_eq!(warm.get_pixel(0, 0).0, [100, 100, 100, 77]);
+    }
+
+    #[test]
+    fn sharpen_increases_edge_contrast_and_keeps_alpha() {
+        let mut source = RgbaImage::from_pixel(20, 20, Rgba([80, 80, 80, 123]));
+        for y in 0..20 { for x in 10..20 { source.put_pixel(x, y, Rgba([160, 160, 160, 123])); } }
+        let output = apply_all(&source, &[Op::Sharpen { value: 1.0 }]);
+        assert!(output.get_pixel(9, 10)[0] < 80);
+        assert!(output.get_pixel(10, 10)[0] > 160);
+        assert!(output.pixels().all(|p| p[3] == 123));
+        assert_eq!(apply_all(&source, &[Op::Sharpen { value: 0.0 }]), source);
+    }
+
+    #[test]
+    fn studio_operations_round_trip() {
+        let ops = vec![Op::Exposure { value: -0.4 }, Op::Warmth { value: 0.2 }, Op::Sharpen { value: 0.6 }];
+        let serialized = serde_json::to_string(&ops).unwrap();
+        assert_eq!(serde_json::from_str::<Vec<Op>>(&serialized).unwrap(), ops);
+    }
+
+    #[test]
     fn crop_is_resolution_independent() {
         let small = RgbaImage::new(100, 100);
         let large = RgbaImage::new(1000, 1000);
@@ -622,13 +672,13 @@ mod tests {
 
         let mut plain = white(80, 80);
         paint(&mut plain, std::slice::from_ref(&stroke), &[], 80.0);
-        assert_eq!(plain.get_pixel(20, 20).0[2], 255);
+        assert_eq!(plain.get_pixel(20, 20).0[0..3], [0, 0, 255]);
 
         // One turn clockwise sends the top-left quadrant to the top-right.
         let mut turned = white(80, 80);
         paint(&mut turned, std::slice::from_ref(&stroke), &[Op::Rotate { turns: 1 }], 80.0);
-        assert_eq!(turned.get_pixel(60, 20).0[2], 255, "should follow the rotation");
-        assert_ne!(turned.get_pixel(20, 20).0[2], 255, "and leave its old position");
+        assert_eq!(turned.get_pixel(60, 20).0[0..3], [0, 0, 255], "should follow the rotation");
+        assert_eq!(turned.get_pixel(20, 20).0[0..3], [255, 255, 255], "and leave its old position");
     }
 
     /// The same stroke must cover the same fraction of the frame whether it is

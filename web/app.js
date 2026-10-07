@@ -1,4 +1,4 @@
-import init, { Editor } from "./pkg/darkroom.js";
+
 
 // This app deliberately touches no persistence API. There is no localStorage,
 // sessionStorage, indexedDB, caches, or OPFS call anywhere below except inside
@@ -28,7 +28,7 @@ let frameQueued = false;
 const blank = () => ({
   crop: null, turns: 0, flipH: false, flipV: false,
   brightness: 0, contrast: 0, saturation: 0,
-  grayscale: false, invert: false, blur: 0,
+  grayscale: false, invert: false, blur: 0, exposure: 0, warmth: 0, sharpen: 0,
   strokes: [], lasso: null,
 });
 
@@ -48,6 +48,9 @@ function buildOps(a, { skipGeometry = false } = {}) {
   if (a.brightness) ops.push({ op: "brightness", value: a.brightness / 100 });
   if (a.contrast) ops.push({ op: "contrast", value: a.contrast / 100 });
   if (a.saturation) ops.push({ op: "saturation", value: a.saturation / 100 });
+  for (const key of ["exposure", "warmth", "sharpen"]) {
+    if (a[key]) ops.push({ op: key, value: a[key] / 100 });
+  }
   if (a.grayscale) ops.push({ op: "grayscale" });
   if (a.invert) ops.push({ op: "invert" });
   if (a.blur) ops.push({ op: "blur", amount: a.blur / 100 });
@@ -61,6 +64,7 @@ function parseOps(ops) {
   const a = blank();
   for (const o of ops) {
     switch (o.op) {
+      case "exposure": case "warmth": case "sharpen": a[o.op] = Math.round(o.value * 100); break;
       case "crop": a.crop = { x: o.x, y: o.y, w: o.w, h: o.h }; break;
       case "rotate": a.turns = o.turns % 4; break;
       case "flip_h": a.flipH = true; break;
@@ -140,19 +144,21 @@ function scheduleRender() {
 }
 
 function draw() {
+  if ($("image-workspace").hidden) return;
   const canvas = $("canvas");
   if (!activeId) { canvas.hidden = true; return; }
 
   const a = adjust.get(activeId);
   // While cropping we show the ungeometried image, so a selection rectangle
   // maps straight onto source coordinates with no composition math.
-  const ops = buildOps(a, { skipGeometry: cropping });
+  const ops = comparing ? [] : buildOps(a, { skipGeometry: cropping });
 
   try {
     ed.set_ops(activeId, JSON.stringify(ops));
     ed.render_preview(activeId, previewCap());
   } catch (e) { return fail(e); }
 
+  if (comparing) ed.set_ops(activeId, JSON.stringify(buildOps(a)));
   const w = ed.preview_width(), h = ed.preview_height();
   // The view must be built after every wasm call in this frame: growing wasm
   // memory detaches the old ArrayBuffer.
@@ -160,6 +166,9 @@ function draw() {
   canvas.width = w; canvas.height = h; canvas.hidden = false;
   canvas.getContext("2d").putImageData(new ImageData(view, w, h), 0, 0);
 
+  applyZoom();
+  updateHistogram(canvas);
+  $("document-info").textContent = `${layers.find(l => l.id === activeId)?.name || "Image"} · Preview ${w} × ${h}`;
   if (cropping) requestAnimationFrame(paintCrop);
   if (painting) requestAnimationFrame(syncInk);
   if (lassoing) requestAnimationFrame(() => { syncInk(); drawLasso(); });
@@ -238,6 +247,7 @@ function renderStrip() {
 }
 
 function selectLayer(id) {
+  comparing = false; $("view-original").setAttribute("aria-pressed", "false");
   if (cropping) exitCrop();
   if (painting) exitPaint();
   if (lassoing) exitLasso();
@@ -273,7 +283,7 @@ function removeLayer(id) {
 function syncControls() {
   if (!activeId) return;
   const a = adjust.get(activeId);
-  for (const k of ["brightness", "contrast", "saturation", "blur"]) {
+  for (const k of ["brightness", "contrast", "saturation", "blur", "exposure", "warmth", "sharpen"]) {
     $("s-" + k).value = a[k];
     $("o-" + k).textContent = a[k];
   }
@@ -286,6 +296,7 @@ function syncControls() {
 
 function edit(fn) {
   if (!activeId) return;
+  comparing = false; $("view-original").setAttribute("aria-pressed", "false");
   pushHistory();
   fn(adjust.get(activeId));
   scheduleRender();
@@ -293,11 +304,12 @@ function edit(fn) {
   requestAnimationFrame(refreshLayers);
 }
 
-for (const k of ["brightness", "contrast", "saturation", "blur"]) {
+for (const k of ["brightness", "contrast", "saturation", "blur", "exposure", "warmth", "sharpen"]) {
   $("s-" + k).addEventListener("input", (e) => {
     if (!activeId) return;
     // One history entry per drag, not one per pixel of travel.
     if (!sliderGesture) { sliderGesture = true; pushHistory(); }
+    comparing = false; $("view-original").setAttribute("aria-pressed", "false");
     const v = Number(e.target.value);
     $("o-" + k).textContent = v;
     adjust.get(activeId)[k] = v;
@@ -494,6 +506,8 @@ $("btn-crop-apply").addEventListener("click", () => {
 });
 
 function enterCrop() {
+  if (comparing) { comparing = false; scheduleRender(); }
+  $("view-original").setAttribute("aria-pressed", "false");
   if (!activeId) return;
   if (painting) exitPaint();
   if (lassoing) exitLasso();
@@ -531,6 +545,8 @@ const CLOSE_PX = 12;     // how near the first point counts as closing the shape
 const DRAG_PX = 10;
 
 function enterLasso() {
+  if (comparing) { comparing = false; scheduleRender(); }
+  $("view-original").setAttribute("aria-pressed", "false");
   if (!activeId) return;
   if (cropping) exitCrop();
   if (painting) exitPaint();
@@ -878,6 +894,8 @@ function syncInk() {
 }
 
 function enterPaint() {
+  if (comparing) { comparing = false; scheduleRender(); }
+  $("view-original").setAttribute("aria-pressed", "false");
   if (!activeId) return;
   if (cropping) exitCrop();
   if (lassoing) exitLasso();
@@ -1109,6 +1127,8 @@ $("file-project").addEventListener("change", async (e) => {
 });
 
 async function importFiles(files) {
+  if (!ed) return say("Build the image engine first; see README.", true);
+  leaveTools(); comparing = false; $("view-original").setAttribute("aria-pressed", "false");
   let added = 0;
   for (const f of files) {
     if (!f.type.startsWith("image/")) continue;
@@ -1129,6 +1149,8 @@ async function importFiles(files) {
 }
 
 async function openProject(file) {
+  if (!ed) return say("Build the image engine first; see README.", true);
+  leaveTools(); comparing = false; $("view-original").setAttribute("aria-pressed", "false");
   try {
     const buf = new Uint8Array(await file.arrayBuffer());
     ed.load_bundle(buf);
@@ -1202,6 +1224,7 @@ stage.addEventListener("drop", async (e) => {
 // --- keyboard --------------------------------------------------------------
 
 document.addEventListener("keydown", (e) => {
+  if ($("image-workspace").hidden || /INPUT|TEXTAREA|SELECT/.test(e.target.tagName)) return;
   if (e.key === "Escape" && cropping) { exitCrop(); return; }
   if (e.key === "Escape" && painting) { exitPaint(); return; }
   if (lassoing) {
@@ -1209,7 +1232,12 @@ document.addEventListener("keydown", (e) => {
     if (e.key === "Enter") { applyLasso(); return; }
   }
   if ($("export-dialog").open) return;
-  if (!(e.ctrlKey || e.metaKey)) return;
+  if (!(e.ctrlKey || e.metaKey)) {
+    const tool = { b: "paint", c: "crop", l: "lasso", e: "eraser" }[e.key.toLowerCase()];
+    if (tool) { e.preventDefault(); activateTool(tool); }
+    if (e.key.toLowerCase() === "i") $("tool-eyedropper").click();
+    return;
+  }
   const k = e.key.toLowerCase();
   if (k === "z") { e.preventDefault(); e.shiftKey ? redo() : undo(); }
   else if (k === "y") { e.preventDefault(); redo(); }
@@ -1269,10 +1297,86 @@ window.addEventListener("pagehide", () => {
   try { ed?.clear(); } catch {}
 });
 
+let comparing = false;
+let sampling = false;
+function leaveTools() {
+  if (cropping) exitCrop();
+  if (painting) exitPaint();
+  if (lassoing) exitLasso();
+  sampling = false;
+  $("canvas").style.cursor = "";
+}
+function activateTool(tool) {
+  if (!activeId) return say("Import an image first.");
+  comparing = false;
+  $("view-original").setAttribute("aria-pressed", "false");
+  leaveTools();
+  scheduleRender();
+  if (tool === "crop") enterCrop();
+  if (tool === "lasso") enterLasso();
+  if (tool === "paint" || tool === "eraser") {
+    enterPaint();
+    if ((tool === "eraser") !== brush.erase) $("btn-eraser").click();
+  }
+}
+document.querySelectorAll("[data-tool]").forEach(button => button.onclick = () => activateTool(button.dataset.tool));
+function applyZoom() {
+  if (!activeId || $("image-workspace").hidden) return;
+  const canvas = $("canvas"), stage = $("stage");
+  const style = getComputedStyle(stage);
+  const width = stage.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+  const height = stage.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom);
+  const scale = Math.min(1, Math.max(1,width)/canvas.width, Math.max(1,height)/canvas.height) * Number($("view-zoom").value);
+  canvas.style.width = `${canvas.width * scale}px`;
+  canvas.style.height = `${canvas.height * scale}px`;
+}
+$("view-zoom").onchange = () => {
+  applyZoom();
+  if (cropping) paintCrop();
+  if (painting || lassoing) { syncInk(); if (lassoing) drawLasso(); }
+};
+$("view-fit").onclick = () => { $("view-zoom").value = "1"; $("view-zoom").onchange(); };
+$("view-original").onclick = () => {
+  if (!activeId) return;
+  leaveTools();
+  comparing = !comparing;
+  $("view-original").setAttribute("aria-pressed", String(comparing));
+  draw();
+  // Keep the saved/exported operation list intact while showing the original.
+  ed.set_ops(activeId, JSON.stringify(buildOps(adjust.get(activeId))));
+};
+$("tool-eyedropper").onclick = () => {
+  if (!activeId) return say("Import an image first.");
+  leaveTools(); sampling = true; $("canvas").style.cursor = "crosshair";
+  say("Click the image to sample a brush color.");
+};
+$("canvas").addEventListener("click", e => {
+  if (!sampling) return;
+  const c = $("canvas"), r = c.getBoundingClientRect();
+  const pixel = c.getContext("2d").getImageData(clamp(Math.floor((e.clientX-r.left)/r.width*c.width),0,c.width-1), clamp(Math.floor((e.clientY-r.top)/r.height*c.height),0,c.height-1),1,1).data;
+  $("hex").value = rgbToHex([...pixel].slice(0,3));
+  $("hex").dispatchEvent(new Event("change"));
+  activateTool("paint");
+});
+function updateHistogram(canvas) {
+  const sample = document.createElement("canvas"); sample.width = 128; sample.height = 128;
+  const ctx = sample.getContext("2d"); ctx.drawImage(canvas,0,0,128,128);
+  const pixels = ctx.getImageData(0,0,128,128).data, bins = new Array(64).fill(0);
+  for (let i=0;i<pixels.length;i+=4) if(pixels[i+3]) bins[Math.min(63, Math.floor((pixels[i]*.2126+pixels[i+1]*.7152+pixels[i+2]*.0722)/4))]++;
+  const h = $("histogram"), hc = h.getContext("2d"), max = Math.max(1,...bins);
+  hc.clearRect(0,0,h.width,h.height); hc.fillStyle = "#91b9e8";
+  bins.forEach((v,i) => hc.fillRect(i*h.width/64,h.height-v/max*65,h.width/64,v/max*65));
+}
+document.addEventListener("workspacechange", leaveTools);
+
 (async () => {
+  try {
+  const { default: init, Editor } = await import("./pkg/darkroom.js");
   wasm = await init();
   ed = new Editor();
   refreshLayers();
-  tickLedger();
-  setInterval(tickLedger, 2000);
+
+  } catch (e) { fail("Image engine unavailable. Build the WebAssembly package first (see README). Video studio is still available."); }
 })();
+tickLedger();
+setInterval(tickLedger, 2000);

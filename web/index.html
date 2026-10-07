@@ -14,7 +14,7 @@
 <header class="bar">
   <div class="brand">
     <h1>Darkroom</h1>
-    <p>Images stay on this machine</p>
+    <p>Your local creative studio</p>
   </div>
 
   <!-- The claim, as a live instrument reading rather than a badge. -->
@@ -36,7 +36,18 @@
   </div>
 </header>
 
-<main>
+<nav class="workspace-bar" aria-label="Workspace">
+  <div class="seg"><button class="btn sm selected" id="mode-image" aria-pressed="true">Image studio</button><button class="btn sm" id="mode-video" aria-pressed="false">Video studio</button></div>
+  <span id="workspace-hint">Develop, retouch, and refine</span>
+</nav>
+<main id="image-workspace">
+  <nav class="tool-rail" aria-label="Image tools">
+    <button class="btn" data-tool="crop" title="Crop (C)" aria-label="Crop">⌗</button>
+    <button class="btn" data-tool="lasso" title="Lasso (L)" aria-label="Lasso">♧</button>
+    <button class="btn" data-tool="paint" title="Brush (B)" aria-label="Brush">✎</button>
+    <button class="btn" data-tool="eraser" title="Eraser (E)" aria-label="Eraser">▱</button>
+    <button class="btn" id="tool-eyedropper" title="Sample image color (I)" aria-label="Eyedropper">◉</button>
+  </nav>
   <aside class="panel" id="panel" aria-label="Adjustments">
     <div class="panel-empty" id="panel-empty">
       <p>No image open.</p>
@@ -69,6 +80,7 @@
         <button class="btn wide ghost" id="btn-clear-ink" hidden>Clear all drawing</button>
       </section>
 
+      <section class="group"><h2>Histogram</h2><canvas id="histogram" width="220" height="70" aria-label="Image luminance histogram"></canvas><p class="note" id="document-info">No document</p></section>
       <section class="group">
         <h2>Tone</h2>
         <label class="slider">
@@ -86,7 +98,7 @@
       </section>
 
       <section class="group">
-        <h2>Treatment</h2>
+        <h2>Detail &amp; color</h2><label class="slider"><span>Exposure</span><output id="o-exposure">0</output><input type="range" id="s-exposure" min="-100" max="100" value="0"></label><label class="slider"><span>Temperature</span><output id="o-warmth">0</output><input type="range" id="s-warmth" min="-100" max="100" value="0"></label><label class="slider"><span>Sharpen</span><output id="o-sharpen">0</output><input type="range" id="s-sharpen" min="0" max="100" value="0"></label>
         <label class="slider">
           <span>Blur</span><output id="o-blur">0</output>
           <input type="range" id="s-blur" min="0" max="100" value="0">
@@ -103,6 +115,7 @@
   </aside>
 
   <section class="stage" id="stage">
+    <div class="view-bar"><button class="btn sm" id="view-fit">Fit</button><label>Zoom <select id="view-zoom"><option value="1">100% of fit</option><option value="1.5">150%</option><option value="2">200%</option><option value="3">300%</option></select></label><button class="btn sm" id="view-original" aria-pressed="false">Compare original</button></div>
     <div class="stage-inner">
       <canvas id="canvas" width="1" height="1"></canvas>
       <canvas id="ink" class="ink" hidden></canvas>
@@ -171,6 +184,42 @@
   </section>
 </main>
 
+<section id="video-workspace" hidden aria-label="Video editor">
+  <aside class="video-properties panel">
+    <h2>Video properties</h2><button class="btn wide btn-key" id="video-import">Import video</button>
+    <p class="note" id="video-name">Open a local clip to begin.</p>
+    <fieldset id="video-controls" disabled>
+      <section class="group"><h2>Trim</h2>
+        <label class="video-field">In point (seconds)<input id="video-in" type="number" min="0" step="0.01" value="0"></label>
+        <button class="btn sm" id="video-mark-in">Set in at playhead</button>
+        <label class="video-field">Out point (seconds)<input id="video-out" type="number" min="0" step="0.01" value="0"></label>
+        <button class="btn sm" id="video-mark-out">Set out at playhead</button>
+      </section>
+      <section class="group"><h2>Playback &amp; audio</h2>
+        <label class="video-field">Speed<select id="video-speed"><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="1.5">1.5×</option><option value="2">2×</option></select></label>
+        <label class="slider"><span>Volume</span><output id="video-volume-value">100%</output><input id="video-volume" type="range" min="0" max="100" value="100"></label>
+        <label class="check"><input id="video-mute" type="checkbox">Mute audio</label>
+      </section>
+      <section class="group"><h2>Color grade</h2>
+        <label class="slider"><span>Brightness</span><input aria-label="Video brightness" id="video-brightness" type="range" min="50" max="150" value="100"></label>
+        <label class="slider"><span>Contrast</span><input aria-label="Video contrast" id="video-contrast" type="range" min="50" max="150" value="100"></label>
+        <label class="slider"><span>Saturation</span><input aria-label="Video saturation" id="video-saturation" type="range" min="0" max="200" value="100"></label>
+        <button class="btn wide" id="video-reset">Reset edits</button>
+      </section>
+      <button class="btn wide btn-key" id="video-export">Export edited video</button>
+      <p class="note">Export records the selected range in real time, up to 1080p. Keep this tab visible. Format depends on your browser. Video edits last for this session.</p>
+    </fieldset>
+  </aside>
+  <div class="video-main">
+    <div class="video-view"><video id="video" playsinline preload="metadata" hidden></video><div id="video-empty"><h2>A little motion. A new story.</h2><p>Import a video to trim, color, and export.</p></div></div>
+    <div class="video-timeline"><div class="transport"><button class="btn" id="video-play" disabled>Play</button><output id="video-time">00:00 / 00:00</output><span id="video-duration">No clip loaded</span></div>
+      <input id="video-seek" type="range" min="0" max="1" step="0.01" value="0" aria-label="Video playhead" disabled>
+      <div class="trim-track"><div id="video-range">Selected clip</div></div>
+      <p role="status" id="video-status">Files stay on your machine.</p><button class="btn sm" id="video-cancel" hidden>Cancel export</button>
+    </div>
+  </div>
+  <input type="file" accept="video/*" id="file-video" hidden>
+</section>
 <!-- Signature: loaded images as a negative sleeve. -->
 <footer class="sleeve" id="sleeve" aria-label="Open images">
   <div class="sprockets" aria-hidden="true"></div>
@@ -213,6 +262,7 @@
 <input type="file" id="file-images" accept="image/*" multiple hidden>
 <input type="file" id="file-project" accept=".darkroom,application/zip" hidden>
 
+<script type="module" src="video.js"></script>
 <script type="module" src="app.js"></script>
 </body>
 </html>
