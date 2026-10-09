@@ -132,5 +132,5 @@ See GitHub's [custom Pages workflow documentation](https://docs.github.com/en/pa
 ```sh
 cargo test
 for f in web/app.js web/video.js web/video/*.js; do node --input-type=module --check < "$f"; done
-node --test tests/
+node --test tests/*.test.mjs
 ```

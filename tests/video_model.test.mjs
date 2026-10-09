@@ -1,5 +1,5 @@
 // Unit tests for the video studio's sequence model. Run with:
-//   node --test tests/
+//   node --test tests/*.test.mjs
 // model.js is a browser ES module with no imports; loading it from a data URL
 // lets Node treat it as ESM without a package.json in the published site.
 import { test } from "node:test";

@@ -33,7 +33,7 @@ jobs:
         run: |
           cargo test --locked
           for f in web/app.js web/video.js web/video/*.js; do node --input-type=module --check < "$f"; done
-          node --test tests/
+          node --test tests/*.test.mjs
 
       - name: Build browser image engine
         run: |
