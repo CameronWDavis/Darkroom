@@ -32,7 +32,9 @@ pub const MAX_SESSION_BYTES: u64 = 768 * MIB;
 pub const MAX_BUNDLE_BYTES: u64 = 800 * MIB;
 /// Entries in the zip's central directory. A real bundle has one per image
 /// plus the manifest; anything far beyond that is not one of ours.
-pub const MAX_BUNDLE_ENTRIES: usize = MAX_DOCUMENTS * 2 + 72;
+pub const MAX_BUNDLE_ENTRIES: usize = MAX_DOCUMENTS * 2 + 64 + MAX_FONTS + 8;
+/// Imported font files held across a session.
+pub const MAX_FONTS: usize = 16;
 /// The manifest is JSON instructions. Long brush sessions are the bulk of it.
 pub const MAX_MANIFEST_BYTES: u64 = 16 * MIB;
 /// Sum of every inflated entry we read out of one bundle.
@@ -121,72 +123,115 @@ pub fn decode(name: &str, bytes: &[u8]) -> Result<RgbaImage, String> {
     Ok(reader.decode().map_err(unreadable)?.to_rgba8())
 }
 
-pub fn check_ops(ops: &[Op]) -> Result<(), String> {
-    let mut strokes = 0usize;
-    let mut points = 0usize;
-    let mut shapes = 0usize;
-    let mut gradients = 0usize;
-    let mut flattened = Vec::new();
-    let mut layer_count = 0;
-    for op in ops {
-        if let Op::Layer { id, name, opacity, content, transform: t, mask, style, .. } = op {
-            layer_count += 1;
-            if id.len() > 100 || name.len() > 300 || !opacity.is_finite() || !(0.0..=1.0).contains(opacity) {
-                return Err("Invalid layer properties.".into());
-            }
-            if !matches!(content.as_ref(), Op::Text { .. } | Op::Paint { .. } | Op::Shapes { .. } | Op::Gradient { .. } | Op::Photo { .. } | Op::Adjustment { .. }) {
-                return Err("Layers can contain text, paint, shapes or gradients; nested layers are unsupported.".into());
-            }
-            let range = |v: f32, lo, hi| v.is_finite() && v >= lo && v <= hi;
-            if !range(t.tx,-2.,2.) || !range(t.ty,-2.,2.) || !range(t.sx,0.01,10.) || !range(t.sy,0.01,10.) || !range(t.rotation,-360.,360.) || !range(t.anchor_x,0.,1.) || !range(t.anchor_y,0.,1.) { return Err("Invalid layer transform.".into()); }
-            if !range(style.shadow_blur,0.,0.05) || !range(style.shadow_x,-0.5,0.5) || !range(style.shadow_y,-0.5,0.5) || !range(style.outline_width,0.,0.05) { return Err("Invalid layer style.".into()); }
-            if let Some(m) = mask {
-                strokes += m.strokes.len(); points += m.strokes.iter().map(|s| s.points.len()/2).sum::<usize>();
-                for s in &m.strokes {
-                    if !range(s.width,0.001,1.) || s.erase || s.points.len()%2 != 0 || s.points.iter().any(|v| !range(*v,0.,1.)) { return Err("Invalid mask stroke.".into()); }
-                }
-            }
-            flattened.push(content.as_ref());
-        } else { flattened.push(op); }
+/// Overlay layers and groups in one image, counted together.
+pub const MAX_LAYERS: usize = 128;
+/// How deeply groups may nest.
+pub const MAX_GROUP_DEPTH: usize = 5;
+pub const MAX_GUIDES: usize = 64;
+
+#[derive(Default)]
+struct Tally { strokes: usize, points: usize, shapes: usize, gradients: usize, text_chars: usize, layers: usize }
+
+fn range(v: f32, lo: f32, hi: f32) -> bool { v.is_finite() && v >= lo && v <= hi }
+
+fn check_mask(mask: &Option<crate::ops::LayerMask>, t: &mut Tally) -> Result<(), String> {
+    let Some(m) = mask else { return Ok(()) };
+    t.strokes += m.strokes.len();
+    t.points += m.strokes.iter().map(|s| s.points.len() / 2).sum::<usize>();
+    for s in &m.strokes {
+        if !range(s.width,0.001,1.) || s.erase || s.points.len()%2 != 0 || s.points.iter().any(|v| !range(*v,0.,1.)) { return Err("Invalid mask stroke.".into()); }
     }
-    if layer_count > 128 { return Err("An image can contain up to 128 overlay layers.".into()); }
-    let mut text_chars = 0;
-    for op in flattened {
+    if let Some(sel) = &m.selection { crate::ops::select::check(sel)?; }
+    check_transform(&m.origin)
+}
+
+fn check_transform(t: &crate::ops::Transform) -> Result<(), String> {
+    if !range(t.tx,-2.,2.) || !range(t.ty,-2.,2.) || !range(t.sx,0.01,10.) || !range(t.sy,0.01,10.) || !range(t.rotation,-360.,360.) || !range(t.anchor_x,0.,1.) || !range(t.anchor_y,0.,1.) { return Err("Invalid layer transform.".into()); }
+    Ok(())
+}
+
+fn check_stack(ops: &[Op], depth: usize, t: &mut Tally) -> Result<(), String> {
+    for op in ops {
         match op {
-            Op::Photo { asset_id, width, height } => {
-                if asset_id.is_empty() || asset_id.len()>100 || !width.is_finite() || !height.is_finite() || !(0.001..=1.).contains(width) || !(0.001..=1.).contains(height) { return Err("Invalid photo layer.".into()); }
-            }
-            Op::Adjustment { exposure, brightness, contrast, saturation, warmth } => {
-                if [exposure,brightness,contrast,saturation,warmth].iter().any(|v| !v.is_finite() || v.abs()>1.) { return Err("Invalid adjustment layer.".into()); }
-            }
-            Op::Text { text, x, y, size, leading, .. } => {
-                text_chars += text.chars().count();
-                if text.chars().count() > 1000 || text.lines().count() > 50 || !x.is_finite() || !y.is_finite()
-                    || !(0.0..=1.0).contains(x) || !(0.0..=1.0).contains(y)
-                    || !size.is_finite() || !(0.001..=0.25).contains(size)
-                    || !leading.is_finite() || !(0.5..=3.0).contains(leading) {
-                    return Err("Text exceeds the supported length, position or size limits.".into());
+            Op::Layer { id, name, opacity, content, transform, mask, style, .. } => {
+                t.layers += 1;
+                if id.len() > 100 || name.len() > 300 || !range(*opacity, 0., 1.) { return Err("Invalid layer properties.".into()); }
+                if !matches!(content.as_ref(), Op::Text { .. } | Op::Paint { .. } | Op::Shapes { .. } | Op::Gradient { .. } | Op::Photo { .. } | Op::Adjustment { .. } | Op::Fill { .. } | Op::Source | Op::Retouch { .. }) {
+                    return Err("Layers can contain text, paint, shapes, gradients, photos, fills, adjustments or retouching; put layers in groups to nest them.".into());
                 }
-            }
-            Op::BaseOpacity { value } if !value.is_finite() || !(0.0..=1.0).contains(value) => return Err("Invalid background opacity.".into()),
-            Op::Paint { strokes: s } => {
-                strokes += s.len();
-                points += s.iter().map(|s| s.points.len() / 2).sum::<usize>();
-            }
-            Op::Shapes { items } => shapes += items.len(),
-            Op::Gradient { .. } => gradients += 1,
-            Op::Lasso { points: p } if p.len() / 2 > MAX_LASSO_POINTS => {
-                return Err(format!("A cut-out has more than {MAX_LASSO_POINTS} points."));
-            }
-            Op::Curves { rgb, red, green, blue } => {
-                if [rgb, red, green, blue].iter().any(|c| c.len() / 2 > MAX_CURVE_POINTS) {
-                    return Err(format!("A curve has more than {MAX_CURVE_POINTS} points."));
+                check_transform(transform)?;
+                let s = style;
+                if !range(s.shadow_blur,0.,0.05) || !range(s.shadow_x,-0.5,0.5) || !range(s.shadow_y,-0.5,0.5) || !range(s.outline_width,0.,0.05)
+                    || !range(s.glow_size,0.,0.1) || !range(s.inner_glow_size,0.,0.1) || !range(s.bevel_size,0.,0.1) || !range(s.bevel_depth,0.,3.) || !range(s.bevel_angle,-360.,360.) {
+                    return Err("Invalid layer style.".into());
                 }
+                check_mask(mask, t)?;
+                check_content(content, t)?;
             }
-            _ => {}
+            Op::Group { id, name, opacity, children, mask, .. } => {
+                t.layers += 1;
+                if depth >= MAX_GROUP_DEPTH { return Err(format!("Groups can nest up to {MAX_GROUP_DEPTH} levels deep.")); }
+                if id.len() > 100 || name.len() > 300 || !range(*opacity, 0., 1.) { return Err("Invalid group properties.".into()); }
+                check_mask(mask, t)?;
+                check_stack(children, depth + 1, t)?;
+            }
+            Op::Guides { x, y } => {
+                if x.len() + y.len() > MAX_GUIDES || x.iter().chain(y).any(|v| !range(*v, 0., 1.)) { return Err(format!("An image can hold up to {MAX_GUIDES} guides inside the frame.")); }
+            }
+            other => check_content(other, t)?,
         }
     }
-    if text_chars > 4000 { return Err("An image can contain up to 4000 text characters.".into()); }
+    Ok(())
+}
+
+fn check_content(op: &Op, t: &mut Tally) -> Result<(), String> {
+    match op {
+        Op::Photo { asset_id, width, height } => {
+            if asset_id.is_empty() || asset_id.len()>100 || !range(*width,0.001,1.) || !range(*height,0.001,1.) { return Err("Invalid photo layer.".into()); }
+        }
+        Op::Adjustment { exposure, brightness, contrast, saturation, warmth } => {
+            if [exposure,brightness,contrast,saturation,warmth].iter().any(|v| !range(**v,-1.,1.)) { return Err("Invalid adjustment layer.".into()); }
+        }
+        Op::Retouch { strokes } => {
+            t.strokes += strokes.len();
+            t.points += strokes.iter().map(|s| s.points.len() / 2).sum::<usize>();
+            for s in strokes { crate::ops::retouch_check(s)?; }
+        }
+        Op::Text { text, x, y, size, leading, font, tracking, box_width, .. } => {
+            t.text_chars += text.chars().count();
+            if text.chars().count() > 1000 || text.lines().count() > 50 || !range(*x,0.,1.) || !range(*y,0.,1.)
+                || !range(*size,0.001,0.25) || !range(*leading,0.5,3.) || !range(*tracking,-0.5,2.) || !range(*box_width,0.,1.)
+                || font.is_empty() || font.len() > 100 {
+                return Err("Text exceeds the supported length, position or size limits.".into());
+            }
+        }
+        Op::BaseOpacity { value } if !range(*value,0.,1.) => return Err("Invalid background opacity.".into()),
+        Op::Paint { strokes: s } => {
+            t.strokes += s.len();
+            t.points += s.iter().map(|s| s.points.len() / 2).sum::<usize>();
+        }
+        Op::Shapes { items } => t.shapes += items.len(),
+        Op::Gradient { .. } => t.gradients += 1,
+        Op::Lasso { points: p } if p.len() / 2 > MAX_LASSO_POINTS => {
+            return Err(format!("A cut-out has more than {MAX_LASSO_POINTS} points."));
+        }
+        Op::Curves { rgb, red, green, blue } => {
+            if [rgb, red, green, blue].iter().any(|c| c.len() / 2 > MAX_CURVE_POINTS) {
+                return Err(format!("A curve has more than {MAX_CURVE_POINTS} points."));
+            }
+        }
+        Op::Layer { .. } | Op::Group { .. } => return Err("Layers can't contain layers; use a group.".into()),
+        _ => {}
+    }
+    Ok(())
+}
+
+pub fn check_ops(ops: &[Op]) -> Result<(), String> {
+    let mut t = Tally::default();
+    check_stack(ops, 0, &mut t)?;
+    if t.layers > MAX_LAYERS { return Err(format!("An image can contain up to {MAX_LAYERS} layers and groups.")); }
+    if t.text_chars > 4000 { return Err("An image can contain up to 4000 text characters.".into()); }
+    let (strokes, points, shapes, gradients) = (t.strokes, t.points, t.shapes, t.gradients);
     if strokes > MAX_STROKES || points > MAX_STROKE_POINTS {
         return Err(format!(
             "Too much brushwork on one image ({strokes} strokes, {points} points). \
@@ -214,6 +259,10 @@ pub fn as_json() -> String {
         "maxShapes": MAX_SHAPES,
         "maxGradients": MAX_GRADIENTS,
         "maxStrokes": MAX_STROKES,
+        "maxLayers": MAX_LAYERS,
+        "maxGroupDepth": MAX_GROUP_DEPTH,
+        "maxGuides": MAX_GUIDES,
+        "maxFonts": MAX_FONTS,
     })
     .to_string()
 }

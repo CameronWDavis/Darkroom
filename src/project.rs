@@ -25,16 +25,38 @@ use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 pub const FORMAT: &str = "darkroom-project";
 /// v2 added the `paint` op; v3 added levels, curves, colour, effects,
-/// gradients and shapes; v4 added editable overlays and text; v5 adds photo
-/// assets, layer transforms, masks, adjustments and styles. Older bundles still load: serde simply never sees
-/// the ops they did not have.
-pub const VERSION: u32 = 5;
+/// gradients and shapes; v4 added editable overlays and text; v5 added photo
+/// assets, layer transforms, masks, adjustments and styles; v6 adds groups,
+/// clipping, selections in masks, fills, retouching, guides, typography and
+/// imported fonts. Older bundles still load: serde simply never sees the ops
+/// they did not have.
+pub const VERSION: u32 = 6;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Manifest {
     pub format: String,
     pub version: u32,
     pub entries: Vec<Entry>,
+    /// Imported fonts used by any document, stored once for the project.
+    #[serde(default)]
+    pub fonts: BTreeMap<String, FontRef>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct FontRef { pub name: String, pub path: String }
+
+/// An imported font file, as the user picked it.
+pub struct FontAsset { pub name: String, pub bytes: Vec<u8> }
+
+/// Every `user:` font the documents' text layers refer to.
+pub fn used_fonts(layers: &[Layer]) -> std::collections::BTreeSet<String> {
+    let mut used = std::collections::BTreeSet::new();
+    for l in layers {
+        crate::ops::walk_layers(&l.ops, &mut |op| if let Op::Layer { content, .. } = op {
+            if let Op::Text { font, .. } = content.as_ref() { if font.starts_with("user:") { used.insert(font.clone()); } }
+        });
+    }
+    used
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -81,13 +103,11 @@ impl Layer {
     pub fn bytes(&self) -> u64 { self.source.len() as u64 + self.assets.values().map(Asset::bytes).sum::<u64>() }
 
     pub fn check_assets(&self, ops: &[Op]) -> Result<(), String> {
-        for op in ops {
-            if let Op::Layer { content, .. } = op {
-                if let Op::Photo { asset_id, .. } = content.as_ref() {
-                    if !self.assets.contains_key(asset_id) { return Err("A photo layer is missing its original image.".into()); }
-                }
-            }
-        }
+        let mut missing = false;
+        crate::ops::walk_layers(ops, &mut |op| if let Op::Layer { content, .. } = op {
+            if let Op::Photo { asset_id, .. } = content.as_ref() { missing |= !self.assets.contains_key(asset_id); }
+        });
+        if missing { return Err("A photo layer is missing its original image.".into()); }
         Ok(())
     }
 
@@ -151,7 +171,7 @@ impl Layer {
     }
 }
 
-pub fn write_bundle(layers: &[Layer]) -> Result<Vec<u8>, String> {
+pub fn write_bundle(layers: &[Layer], fonts: &BTreeMap<String, FontAsset>) -> Result<Vec<u8>, String> {
     let mut zip = ZipWriter::new(Cursor::new(Vec::<u8>::new()));
 
     // Media is already compressed (PNG/JPEG/WebP). Deflating it again costs
@@ -165,17 +185,17 @@ pub fn write_bundle(layers: &[Layer]) -> Result<Vec<u8>, String> {
         zip.start_file(&path, stored).map_err(z)?;
         zip.write_all(&l.source).map_err(|e| e.to_string())?;
         l.check_assets(&l.ops)?;
+        let mut used = Vec::new();
+        crate::ops::walk_layers(&l.ops, &mut |op| if let Op::Layer { content, .. } = op {
+            if let Op::Photo { asset_id, .. } = content.as_ref() { used.push(asset_id.clone()); }
+        });
         let mut assets = BTreeMap::new();
-        for op in &l.ops {
-            if let Op::Layer { content, .. } = op {
-                if let Op::Photo { asset_id, .. } = content.as_ref() {
-                    if assets.contains_key(asset_id) { continue; }
-                    let path = format!("assets/{}/{}.bin", entries.len(), assets.len());
-                    zip.start_file(&path, stored).map_err(z)?;
-                    zip.write_all(&l.assets[asset_id].source).map_err(|e| e.to_string())?;
-                    assets.insert(asset_id.clone(), path);
-                }
-            }
+        for asset_id in used {
+            if assets.contains_key(&asset_id) { continue; }
+            let path = format!("assets/{}/{}.bin", entries.len(), assets.len());
+            zip.start_file(&path, stored).map_err(z)?;
+            zip.write_all(&l.assets[&asset_id].source).map_err(|e| e.to_string())?;
+            assets.insert(asset_id, path);
         }
         entries.push(Entry {
             assets,
@@ -186,7 +206,16 @@ pub fn write_bundle(layers: &[Layer]) -> Result<Vec<u8>, String> {
         });
     }
 
-    let manifest = Manifest { format: FORMAT.into(), version: VERSION, entries };
+    let mut font_refs = BTreeMap::new();
+    for (n, id) in used_fonts(layers).into_iter().enumerate() {
+        let font = fonts.get(&id).ok_or("A text layer uses an imported font that is no longer loaded.")?;
+        let path = format!("fonts/{n}.bin");
+        zip.start_file(&path, stored).map_err(z)?;
+        zip.write_all(&font.bytes).map_err(|e| e.to_string())?;
+        font_refs.insert(id, FontRef { name: font.name.clone(), path });
+    }
+
+    let manifest = Manifest { format: FORMAT.into(), version: VERSION, entries, fonts: font_refs };
     zip.start_file("manifest.json", deflated).map_err(z)?;
     let json = serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?;
     zip.write_all(&json).map_err(|e| e.to_string())?;
@@ -194,7 +223,9 @@ pub fn write_bundle(layers: &[Layer]) -> Result<Vec<u8>, String> {
     Ok(zip.finish().map_err(z)?.into_inner())
 }
 
-pub fn read_bundle(bytes: &[u8]) -> Result<Vec<Layer>, String> {
+pub type Bundle = (Vec<Layer>, BTreeMap<String, FontAsset>);
+
+pub fn read_bundle(bytes: &[u8]) -> Result<Bundle, String> {
     if bytes.len() as u64 > MAX_BUNDLE_BYTES {
         return Err(format!(
             "This project is {}. Darkroom opens projects up to {}.",
@@ -262,7 +293,18 @@ pub fn read_bundle(bytes: &[u8]) -> Result<Vec<Layer>, String> {
         if held > limits::MAX_SESSION_BYTES { return Err("The project exceeds the image memory budget.".into()); }
         layers.push(layer);
     }
-    Ok(layers)
+    if manifest.fonts.len() > limits::MAX_FONTS { return Err(format!("A project can include up to {} imported fonts.", limits::MAX_FONTS)); }
+    let mut fonts = BTreeMap::new();
+    for (id, f) in manifest.fonts {
+        if !id.starts_with("user:") || id.len() > 100 || f.name.len() > 200 { return Err("Invalid imported font.".into()); }
+        let bytes = read_entry(&mut zip, &f.path, crate::ops::text::MAX_FONT_BYTES as u64, &mut budget)
+            .map_err(|e| e.unwrap_or_else(|| format!("The bundle is missing the font '{}'.", f.name)))?;
+        crate::ops::text::validate(&bytes).map_err(|e| format!("'{}': {e}", f.name))?;
+        held += bytes.len() as u64;
+        fonts.insert(id, FontAsset { name: f.name, bytes });
+    }
+    if held > limits::MAX_SESSION_BYTES { return Err("The project exceeds the image memory budget.".into()); }
+    Ok((layers, fonts))
 }
 
 /// Reads one entry with every size claim verified against what actually
@@ -357,14 +399,14 @@ mod tests {
         let entries: Vec<Entry> = (0..n)
             .map(|i| Entry { id: format!("l{i}"), name: format!("{i}.png"), assets: BTreeMap::new(), media: "media/a.png".into(), ops: vec![] })
             .collect();
-        serde_json::to_vec(&Manifest { format: FORMAT.into(), version: VERSION, entries }).unwrap()
+        serde_json::to_vec(&Manifest { format: FORMAT.into(), version: VERSION, entries, fonts: BTreeMap::new() }).unwrap()
     }
 
     #[test]
     fn a_saved_bundle_reads_back() {
         let mut layers = vec![Layer::new("l1".into(), "a.png".into(), "png".into(), png(4, 3), vec![Op::Invert])];
-        let bytes = write_bundle(&layers).unwrap();
-        let back = read_bundle(&bytes).unwrap();
+        let bytes = write_bundle(&layers, &BTreeMap::new()).unwrap();
+        let back = read_bundle(&bytes).unwrap().0;
         assert_eq!(back.len(), 1);
         assert_eq!(back[0].ops, vec![Op::Invert]);
         assert_eq!(back[0].source, layers[0].source);
@@ -379,10 +421,31 @@ mod tests {
         l.assets.insert("p1".into(),Asset::new(original.clone()).unwrap());
         l.assets.insert("unused".into(),Asset::new(png(10,10)).unwrap());
         let expected=crate::ops::apply_with_assets(&limits::decode("base",&l.source).unwrap(),&l.ops,&l.assets,true);
-        let bytes=write_bundle(&[l]).unwrap();
+        let bytes=write_bundle(&[l], &BTreeMap::new()).unwrap();
         assert_eq!(ZipArchive::new(Cursor::new(&bytes)).unwrap().len(),3);
-        let back=read_bundle(&bytes).unwrap();assert_eq!(back[0].assets.len(),1);assert_eq!(back[0].assets["p1"].source,original);
+        let back=read_bundle(&bytes).unwrap().0;assert_eq!(back[0].assets.len(),1);assert_eq!(back[0].assets["p1"].source,original);
         assert_eq!(expected,crate::ops::apply_with_assets(&limits::decode("base",&back[0].source).unwrap(),&back[0].ops,&back[0].assets,true));
+    }
+
+    #[test]
+    fn grouped_photos_and_imported_fonts_round_trip() {
+        let photo: Op = serde_json::from_value(serde_json::json!({"op":"layer","id":"photo","name":"Photo","visible":true,"opacity":1,"blend":"normal","content":{"op":"photo","asset_id":"p1","width":0.5,"height":0.5}})).unwrap();
+        let text: Op = serde_json::from_value(serde_json::json!({"op":"layer","id":"t","name":"T","visible":true,"opacity":1,"blend":"normal","clip":true,"content":{"op":"text","text":"Hi","x":0.1,"y":0.1,"size":0.1,"color":[255,255,255,255],"bold":false,"align":"left","leading":1.2,"font":"user:abc","tracking":0.1,"box_width":0.5}})).unwrap();
+        let group = Op::Group { id: "g".into(), name: "G".into(), visible: true, opacity: 1., blend: crate::ops::Blend::Normal, pass_through: true, children: vec![photo, text], mask: None, clip: false, collapsed: true };
+        let mut l = Layer::new("l1".into(), "base.png".into(), "png".into(), png(40, 30), vec![Op::Guides { x: vec![0.5], y: vec![] }, group]);
+        l.assets.insert("p1".into(), Asset::new(png(8, 8)).unwrap());
+        let mut fonts = BTreeMap::new();
+        assert!(write_bundle(std::slice::from_ref(&l), &fonts).unwrap_err().contains("imported font"));
+        let lato = include_bytes!("../web/fonts/Lato-Regular.ttf").to_vec();
+        fonts.insert("user:abc".to_string(), FontAsset { name: "My Font".into(), bytes: lato.clone() });
+        fonts.insert("user:unused".to_string(), FontAsset { name: "Spare".into(), bytes: lato.clone() });
+        let ops = l.ops.clone();
+        let (back, fonts) = read_bundle(&write_bundle(&[l], &fonts).unwrap()).unwrap();
+        assert_eq!(back[0].ops, ops);
+        assert_eq!(back[0].assets.len(), 1);
+        assert_eq!(fonts.len(), 1);
+        assert_eq!(fonts["user:abc"].name, "My Font");
+        assert_eq!(fonts["user:abc"].bytes, lato);
     }
 
     #[test]

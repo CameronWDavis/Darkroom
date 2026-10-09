@@ -33,11 +33,15 @@
   <nav class="tool-rail" aria-label="Image tools">
     <button class="btn" data-tool="transform" title="Move / transform layer (V)" aria-label="Transform">↖</button>
     <button class="btn" data-tool="mask" title="Paint layer mask (M)" aria-label="Mask">◑</button>
+    <button class="btn" data-tool="select" title="Select — rectangle, ellipse, lasso or magic wand (W)" aria-label="Select">⬚</button>
     <button class="btn" data-tool="hand" title="Hand — pan the view (H, or hold Space)" aria-label="Hand">✋</button>
     <button class="btn" data-tool="crop" title="Crop (C)" aria-label="Crop">⌗</button>
     <button class="btn" data-tool="lasso" title="Lasso (L)" aria-label="Lasso">♧</button>
     <button class="btn" data-tool="paint" title="Brush (B)" aria-label="Brush">✎</button>
     <button class="btn" data-tool="eraser" title="Eraser (E)" aria-label="Eraser">▱</button>
+    <button class="btn" data-tool="clone" title="Clone stamp — Alt/Option-click to set the source (S)" aria-label="Clone stamp">⎘</button>
+    <button class="btn" data-tool="heal" title="Healing brush — paint to spot heal, or Alt/Option-click a source (J)" aria-label="Healing brush">✚</button>
+    <button class="btn" data-tool="dodge" title="Dodge and burn — lighten or darken (O)" aria-label="Dodge and burn">☀</button>
     <button class="btn" data-tool="gradient" title="Gradient (G)" aria-label="Gradient">◐</button>
     <button class="btn" data-tool="shape" title="Shapes (U)" aria-label="Shapes">▭</button>
     <button class="btn" data-tool="eyedropper" id="tool-eyedropper" title="Sample image color (I)" aria-label="Eyedropper">◉</button>
@@ -62,8 +66,10 @@
         <summary>Layers</summary>
         <div class="row-btns two"><button class="btn sm" id="layer-add-text">+ Text</button><button class="btn sm" id="layer-add-paint">+ Drawing</button></div>
         <div class="row-btns two"><button class="btn sm" id="layer-add-photo">+ Photo</button><button class="btn sm" id="layer-add-adjustment">+ Adjustment</button></div>
+        <div class="row-btns three"><button class="btn sm" id="layer-group" title="Group the selected layers (Ctrl+G)">Group</button><button class="btn sm" id="layer-ungroup" title="Ungroup (Ctrl+Shift+G)">Ungroup</button><button class="btn sm" id="layer-clip" aria-pressed="false" title="Clip to the layer below (Ctrl+Alt+G)">Clip</button></div>
         <input type="file" id="file-layer-photo" accept="image/png,image/jpeg,image/webp,image/gif,image/bmp,image/tiff" hidden>
         <div id="art-layers" class="art-layers" aria-label="Layers, topmost first"></div>
+        <p class="note tight" id="layer-multi" hidden></p>
         <label class="art-field">Name<input id="layer-name" maxlength="64"></label>
         <label class="slider"><span>Opacity</span><output id="layer-opacity-value">100%</output><input type="range" id="layer-opacity" min="0" max="100" value="100"></label>
         <label class="art-field">Blend<select id="layer-blend"><option value="normal">Normal</option><option value="multiply">Multiply</option><option value="screen">Screen</option><option value="overlay">Overlay</option><option value="soft_light">Soft light</option><option value="hard_light">Hard light</option><option value="darken">Darken</option><option value="lighten">Lighten</option><option value="difference">Difference</option><option value="color_dodge">Color dodge</option><option value="color_burn">Color burn</option></select></label>
@@ -72,10 +78,13 @@
           <label class="art-field">Text<textarea id="text-content" rows="3" maxlength="1000" spellcheck="true"></textarea></label>
           <div class="row-btns two"><label class="art-field">Size (% of short edge)<input type="number" id="text-size" min="0.1" max="25" step="0.1"></label><label class="art-field">Line spacing<input type="number" id="text-leading" min="0.5" max="3" step="0.1"></label></div>
           <div class="row-btns two"><label class="art-field">X (%)<input id="text-x" type="number" min="0" max="100" step="0.1"></label><label class="art-field">Y (%)<input id="text-y" type="number" min="0" max="100" step="0.1"></label></div>
-          <label class="art-field">Alignment<select id="text-align"><option value="left">Left</option><option value="center">Center</option><option value="right">Right</option></select></label>
-          <label class="art-field">Color<input type="color" id="text-color" value="#ffffff"></label>
-          <label class="check"><input id="text-bold" type="checkbox">Bold</label>
-          <p class="note">Lato · Drag on the canvas with Type (T) to move the selected text. Text stays editable when saved.</p>
+          <div class="row-btns two"><label class="art-field">Font<select id="text-font"></select></label><label class="art-field">Alignment<select id="text-align"><option value="left">Left</option><option value="center">Center</option><option value="right">Right</option><option value="justify">Justify</option></select></label></div>
+          <input type="file" id="file-font" accept=".ttf,.otf,font/ttf,font/otf" hidden>
+          <div class="row-btns two"><label class="check"><input id="text-bold" type="checkbox">Bold</label><label class="check"><input id="text-italic" type="checkbox">Italic</label></div>
+          <div class="row-btns two"><label class="art-field">Letter spacing (1/1000 em)<input type="number" id="text-tracking" min="-500" max="2000" step="10"></label><label class="art-field">Color<input type="color" id="text-color" value="#ffffff"></label></div>
+          <label class="check"><input id="text-box" type="checkbox">Paragraph box (wraps lines)</label>
+          <label class="art-field" id="text-box-field" hidden>Box width (% of image width)<input type="number" id="text-box-width" min="1" max="100" step="0.5"></label>
+          <p class="note">Drag on the canvas with Type (T) to move the selected text, or drag the box's edge handle to rewrap it. With no text selected, click to place text or drag out a paragraph box. Text stays editable when saved.</p>
         </div>
         <div id="layer-extra" hidden>
           <details id="transform-properties" class="layer-section" open>
@@ -87,6 +96,9 @@
             <label class="check"><input type="checkbox" id="transform-lock" checked>Keep proportions when dragging</label>
             <p class="note">Drag to move, square corners to resize, or the round handle to rotate. Hold Shift to snap rotation to 15°.</p>
           </details>
+          <p class="note" id="group-note" hidden>Groups move with the Transform tool (V) and align as one unit. Blend <em>Pass through</em> lets adjustments inside reach the layers below the group.</p>
+          <p class="note" id="retouch-note" hidden>Retouching samples the layers beneath it. Paint with Clone (S), Healing (J) or Dodge and burn (O) while this layer is selected.</p>
+          <label class="art-field" id="fill-properties" hidden>Fill color<input type="color" id="fill-color" value="#ffffff"></label>
           <details id="adjustment-properties" class="layer-section" open hidden>
             <summary>Adjustment layer</summary>
             <div id="adjustment-sliders"></div>
@@ -105,16 +117,52 @@
             </div>
           </details>
           <details id="style-properties" class="layer-section">
-            <summary>Shadow &amp; outline</summary>
+            <summary>Layer styles</summary>
             <label class="check"><input type="checkbox" id="style-shadow">Drop shadow</label>
             <div class="row-btns two"><label class="art-field">Color<input type="color" id="style-shadow-color" value="#000000"></label><label class="art-field">Opacity (%)<input type="number" id="style-shadow-opacity" min="0" max="100"></label></div>
             <label class="art-field">Blur (% of short edge)<input type="number" id="style-shadow-blur" min="0" max="5" step="0.1"></label>
             <div class="row-btns two"><label class="art-field">Offset X (%)<input type="number" id="style-shadow-x" min="-50" max="50" step="0.1"></label><label class="art-field">Offset Y (%)<input type="number" id="style-shadow-y" min="-50" max="50" step="0.1"></label></div>
             <label class="check"><input type="checkbox" id="style-outline">Outline</label>
             <div class="row-btns two"><label class="art-field">Color<input type="color" id="style-outline-color" value="#ffffff"></label><label class="art-field">Width (% of short edge)<input type="number" id="style-outline-width" min="0" max="5" step="0.1"></label></div>
+            <label class="check"><input type="checkbox" id="style-glow">Outer glow</label>
+            <div class="row-btns three"><label class="art-field">Color<input type="color" id="style-glow-color" value="#ffd678"></label><label class="art-field">Opacity (%)<input type="number" id="style-glow-opacity" min="0" max="100"></label><label class="art-field">Size (%)<input type="number" id="style-glow-size" min="0" max="10" step="0.1"></label></div>
+            <label class="check"><input type="checkbox" id="style-inner_glow">Inner glow</label>
+            <div class="row-btns three"><label class="art-field">Color<input type="color" id="style-inner_glow-color" value="#ffffff"></label><label class="art-field">Opacity (%)<input type="number" id="style-inner_glow-opacity" min="0" max="100"></label><label class="art-field">Size (%)<input type="number" id="style-inner_glow-size" min="0" max="10" step="0.1"></label></div>
+            <label class="check"><input type="checkbox" id="style-bevel">Bevel</label>
+            <div class="row-btns three"><label class="art-field">Size (%)<input type="number" id="style-bevel-size" min="0" max="10" step="0.1"></label><label class="art-field">Depth (%)<input type="number" id="style-bevel-depth" min="0" max="300" step="5"></label><label class="art-field">Light angle (°)<input type="number" id="style-bevel-angle" min="-360" max="360" step="5"></label></div>
+            <div class="row-btns two"><label class="art-field">Highlight<input type="color" id="style-bevel-highlight" value="#ffffff"></label><label class="art-field">Shadow<input type="color" id="style-bevel-shadow" value="#000000"></label></div>
           </details>
         </div>
         <p class="note">Topmost layers appear in front. Photo layers keep their original files. Save a project to preserve editable layers, masks, and effects.</p>
+      </details>
+
+      <details class="group" id="selection-panel" open hidden>
+        <summary>Selection</summary>
+        <div class="row-btns two"><label class="art-field">Feather (%)<input type="number" id="sel-feather" min="0" max="10" step="0.1" value="0"></label><label class="art-field">Expand / contract (%)<input type="number" id="sel-shift" min="-10" max="10" step="0.1" value="0"></label></div>
+        <div class="row-btns two"><label class="art-field">Smooth (%)<input type="number" id="sel-smooth" min="0" max="10" step="0.1" value="0"></label><label class="art-field">Refine edge (%)<input type="number" id="sel-refine" min="0" max="10" step="0.1" value="0"></label></div>
+        <label class="check"><input type="checkbox" id="sel-invert">Invert selection</label>
+        <div class="row-btns two"><button class="btn sm" id="sel-mask" title="Make the selection the selected layer's mask">Mask layer</button><button class="btn sm" id="sel-copy" title="Copy the selected part of the photo to a new layer">Copy to layer</button></div>
+        <div class="row-btns two"><button class="btn sm" id="sel-adjust" title="New adjustment layer limited to the selection">+ Adjustment</button><button class="btn sm" id="sel-crop">Crop to selection</button></div>
+        <div class="row-btns two"><button class="btn sm" id="sel-fill">Fill with color</button><input type="color" id="sel-fill-color" value="#e0a032" aria-label="Fill color"></div>
+        <button class="btn wide ghost" id="sel-clear">Deselect (Ctrl+D)</button>
+        <p class="note">Refine edge pulls the outline onto edges in the photo, for hair and soft subjects. The magic wand samples the original photo.</p>
+      </details>
+
+      <details class="group" id="arrange-panel" open>
+        <summary>Arrange</summary>
+        <div class="seg three align-seg" role="group" aria-label="Align horizontally">
+          <button class="btn sm" data-align="left" title="Align left edges">⇤</button><button class="btn sm" data-align="hcenter" title="Align horizontal centers">↔</button><button class="btn sm" data-align="right" title="Align right edges">⇥</button>
+        </div>
+        <div class="seg three align-seg" role="group" aria-label="Align vertically">
+          <button class="btn sm" data-align="top" title="Align top edges">⤒</button><button class="btn sm" data-align="vcenter" title="Align vertical centers">↕</button><button class="btn sm" data-align="bottom" title="Align bottom edges">⤓</button>
+        </div>
+        <div class="row-btns two"><button class="btn sm" id="distribute-h" title="Even horizontal spacing (3 or more layers)">Distribute ↔</button><button class="btn sm" id="distribute-v" title="Even vertical spacing (3 or more layers)">Distribute ↕</button></div>
+        <label class="art-field">Align to<select id="align-to"><option value="canvas">Canvas</option><option value="layers">Selected layers</option></select></label>
+        <div class="row-btns three"><button class="btn sm" id="guide-add-v" title="Add a vertical guide">+ Vertical</button><button class="btn sm" id="guide-add-h" title="Add a horizontal guide">+ Horizontal</button><button class="btn sm ghost" id="guide-clear">Clear</button></div>
+        <ul class="guide-list" id="guide-list"></ul>
+        <div class="row-btns two"><label class="check"><input type="checkbox" id="view-guides" checked>Show guides</label><label class="check"><input type="checkbox" id="view-snap" checked>Snap</label></div>
+        <div class="row-btns two"><label class="check"><input type="checkbox" id="view-grid">Grid</label><label class="art-field flush-field">Grid (% of short edge)<input type="number" id="grid-size" min="1" max="50" step="1" value="10"></label></div>
+        <p class="note">Guides are saved with the project. Drag them with the Transform tool (V); drag one off the image to remove it. Layers snap to guides, the grid, the image edges and center, and other layers.</p>
       </details>
 
       <details class="group" open>
@@ -227,6 +275,7 @@
     <div class="stage-inner">
       <canvas id="canvas" width="1" height="1"></canvas>
       <canvas id="ink" class="ink" hidden></canvas>
+      <canvas id="hud" class="hud" aria-hidden="true"></canvas>
       <div class="crop-layer" id="crop-layer" hidden>
         <div class="crop-box" id="crop-box">
           <span class="grid" aria-hidden="true"></span>
@@ -268,6 +317,31 @@
         <div class="swatches" id="swatches"></div>
         <input type="text" id="hex" class="hex" spellcheck="false" maxlength="7">
       </div>
+    </div>
+
+    <div class="tool-bar" id="select-bar" hidden>
+      <div class="seg four" id="select-kind" role="group" aria-label="Selection shape">
+        <button class="btn sm" data-kind="rect" aria-pressed="true" title="Rectangle">▭</button>
+        <button class="btn sm" data-kind="ellipse" aria-pressed="false" title="Ellipse">◯</button>
+        <button class="btn sm" data-kind="lasso" aria-pressed="false" title="Freehand lasso">ᔓ</button>
+        <button class="btn sm" data-kind="wand" aria-pressed="false" title="Magic wand">✦</button>
+      </div>
+      <select id="select-mode" aria-label="Combine"><option value="new">New</option><option value="add">Add (Shift)</option><option value="subtract">Subtract (Alt)</option><option value="intersect">Intersect</option></select>
+      <label class="inline" id="wand-options" hidden><span>Tolerance</span><input type="range" id="wand-tolerance" min="0" max="100" value="12"><label class="check inline"><input type="checkbox" id="wand-contiguous" checked><span>Contiguous</span></label></label>
+      <button class="btn sm ghost" id="select-all">All</button>
+      <button class="btn sm ghost" id="select-none">None</button>
+      <button class="btn sm ghost" id="select-inverse">Invert</button>
+      <button class="btn sm btn-key" id="btn-select-done">Done</button>
+    </div>
+
+    <div class="tool-bar" id="retouch-bar" hidden>
+      <select id="retouch-mode" aria-label="Dodge or burn" hidden><option value="dodge">Dodge (lighten)</option><option value="burn">Burn (darken)</option></select>
+      <select id="retouch-range" aria-label="Tonal range" hidden><option value="shadows">Shadows</option><option value="midtones" selected>Midtones</option><option value="highlights">Highlights</option></select>
+      <label class="inline"><span>Size</span><input type="range" id="retouch-size" min="1" max="100" value="14"></label>
+      <label class="inline"><span>Hardness</span><input type="range" id="retouch-hardness" min="0" max="100" value="50"></label>
+      <label class="inline"><span id="retouch-strength-label">Opacity</span><input type="range" id="retouch-strength" min="1" max="100" value="100"></label>
+      <span class="tool-hint" id="retouch-hint"></span>
+      <button class="btn sm btn-key" id="btn-retouch-done">Done</button>
     </div>
 
     <div class="tool-bar" id="gradient-bar" hidden>
@@ -473,8 +547,16 @@
 
 <dialog class="sheet wide-sheet" id="shortcuts-dialog">
   <h2>Keyboard shortcuts</h2>
-  <p><kbd>V</kbd> Layer transform · <kbd>M</kbd> Layer mask brush</p>
+  <p><kbd>V</kbd> Layer transform · <kbd>M</kbd> Layer mask brush · <kbd>W</kbd> Select · <kbd>T</kbd> Type</p>
   <dl class="keys">
+    <div><dt>S / J / O</dt><dd>Clone / heal / dodge and burn</dd></div>
+    <div><dt>Alt+click</dt><dd>Set the clone or healing source</dd></div>
+    <div><dt>Ctrl+A / Ctrl+D / Ctrl+Shift+I</dt><dd>Select all / deselect / invert</dd></div>
+    <div><dt>Shift / Alt while selecting</dt><dd>Add to / subtract from the selection</dd></div>
+    <div><dt>Ctrl+G / Ctrl+Shift+G</dt><dd>Group / ungroup layers</dd></div>
+    <div><dt>Ctrl+Alt+G</dt><dd>Clip to the layer below</dd></div>
+    <div><dt>Ctrl/Shift+click a layer</dt><dd>Select several layers</dd></div>
+    <div><dt>Ctrl+; / Ctrl+' / Ctrl+Shift+;</dt><dd>Guides / grid / snapping</dd></div>
     <div><dt>H / hold Space</dt><dd>Hand — pan</dd></div>
     <div><dt>C</dt><dd>Crop</dd></div>
     <div><dt>L</dt><dd>Lasso scissors</dd></div>

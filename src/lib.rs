@@ -6,7 +6,8 @@ use image::codecs::jpeg::JpegEncoder;
 use image::codecs::png::PngEncoder;
 use image::codecs::webp::WebPEncoder;
 use image::{imageops::FilterType, ExtendedColorType, ImageEncoder, RgbaImage};
-use limits::{MAX_DOCUMENTS, MAX_EDGE, MAX_PIXELS, MAX_SESSION_BYTES};
+use limits::{MAX_DOCUMENTS, MAX_EDGE, MAX_FONTS, MAX_PIXELS, MAX_SESSION_BYTES};
+use std::collections::BTreeMap;
 use ops::Op;
 use project::Layer;
 use std::io::Cursor;
@@ -22,6 +23,21 @@ pub fn start() {
 #[wasm_bindgen]
 pub fn curve_lut(points: &[f32]) -> Vec<u8> {
     ops::curve_lut(points).to_vec()
+}
+
+/// Makes one face of a bundled font family available to the text renderer,
+/// under `family:r`, `family:b`, `family:i` or `family:bi`. The UI fetches
+/// these from `fonts/` the first time a family is used.
+#[wasm_bindgen]
+pub fn register_font(key: &str, bytes: &[u8]) -> Result<(), JsValue> {
+    if key.starts_with("user:") { return Err(err("Imported fonts are added with Editor.add_font.")); }
+    ops::text::register(key, bytes).map_err(err)
+}
+
+/// Whether a font face is ready to render.
+#[wasm_bindgen]
+pub fn font_ready(key: &str) -> bool {
+    ops::text::is_registered(key)
 }
 
 fn err(e: impl Into<String>) -> JsValue {
@@ -45,6 +61,8 @@ pub struct Editor {
     scaled: Option<(String, u32, RgbaImage)>,
     /// Most recently used first; only these keep their full decode.
     recent: Vec<String>,
+    /// Imported fonts, shared by every document in the session.
+    fonts: BTreeMap<String, project::FontAsset>,
 }
 
 #[wasm_bindgen]
@@ -57,6 +75,7 @@ impl Editor {
             preview: RgbaImage::new(1, 1),
             scaled: None,
             recent: Vec::new(),
+            fonts: BTreeMap::new(),
         }
     }
 
@@ -109,11 +128,63 @@ impl Editor {
         Ok(serde_json::json!({ "width":dims.0, "height":dims.1 }).to_string())
     }
 
-    pub fn overlay_bounds(&mut self, id: &str, layer_id: &str) -> Result<String, JsValue> {
+    /// Bounds of a layer's untransformed content, `[x, y, w, h]` in source
+    /// space. `max_dim` is the preview size, whose source copy is cached.
+    pub fn overlay_bounds(&mut self, id: &str, layer_id: &str, max_dim: u32) -> Result<String, JsValue> {
         let dims = self.layer_mut(id)?.dims().map_err(err)?;
+        let small = self.scaled_source(id, max_dim)?.clone();
         let layer = self.layer(id)?;
-        let op = layer.ops.iter().find(|o| matches!(o, Op::Layer { id, .. } if id == layer_id)).ok_or_else(|| err("Select a layer first."))?;
-        Ok(serde_json::to_string(&ops::content_bounds(op, dims, &layer.assets)).unwrap())
+        let op = ops::find_layer(&layer.ops, layer_id).ok_or_else(|| err("Select a layer first."))?;
+        Ok(serde_json::to_string(&ops::content_bounds(op, dims, &layer.assets, &small)).unwrap())
+    }
+
+    /// An imported font file. `font_id` must start with `user:`; text layers
+    /// refer to it by that id, and saved projects carry the file with them.
+    pub fn add_font(&mut self, font_id: &str, name: &str, bytes: &[u8]) -> Result<(), JsValue> {
+        if !font_id.starts_with("user:") || font_id.len() > 100 || name.is_empty() || name.len() > 200 { return Err(err("Invalid font name.")); }
+        if self.fonts.contains_key(font_id) { return Ok(()); }
+        if self.fonts.len() >= MAX_FONTS { return Err(err(format!("Up to {MAX_FONTS} imported fonts can be open at once."))); }
+        ops::text::register(&format!("{font_id}:r"), bytes).map_err(err)?;
+        self.fonts.insert(font_id.into(), project::FontAsset { name: name.into(), bytes: bytes.to_vec() });
+        Ok(())
+    }
+
+    /// `[{id, name}]` for the imported fonts in this session.
+    pub fn fonts_json(&self) -> String {
+        serde_json::to_string(&self.fonts.iter().map(|(id, f)| serde_json::json!({ "id": id, "name": f.name })).collect::<Vec<_>>()).unwrap()
+    }
+
+    /// The selection as an 8-bit mask over the rendered output, the same size
+    /// as `render_preview` produces at `max_dim`, for drawing marching ants.
+    pub fn selection_preview(&mut self, id: &str, selection_json: &str, max_dim: u32) -> Result<Vec<u8>, JsValue> {
+        let sel = parse_selection(selection_json)?;
+        let base = self.scaled_source(id, max_dim)?.clone();
+        let ((w, h), geo) = ops::geometry_of(base.width(), base.height(), &self.layer(id)?.ops);
+        let raster = ops::select::rasterize(&sel, &base);
+        let mut out = Vec::with_capacity((w * h) as usize);
+        for y in 0..h { for x in 0..w {
+            let (sx, sy) = ops::unmap((x as f32 + 0.5) / w as f32, (y as f32 + 0.5) / h as f32, &geo);
+            out.push((raster.sample(sx, sy) * 255.0 + 0.5) as u8);
+        }}
+        Ok(out)
+    }
+
+    /// `[x, y, w, h]` of the selected area in normalized source coordinates,
+    /// or `null` when nothing is selected.
+    pub fn selection_bounds(&mut self, id: &str, selection_json: &str, max_dim: u32) -> Result<String, JsValue> {
+        let sel = parse_selection(selection_json)?;
+        let base = self.scaled_source(id, max_dim)?;
+        Ok(serde_json::to_string(&ops::select::rasterize(&sel, base).bounds()).unwrap())
+    }
+
+    /// `[dx, dy]` source offset for a spot-healing stroke, chosen from the
+    /// photograph around it.
+    pub fn heal_offset(&mut self, id: &str, points: &[f32], width: f32, max_dim: u32) -> Result<String, JsValue> {
+        if points.len() < 2 || points.len() % 2 != 0 || points.iter().any(|v| !v.is_finite()) || !(0.001..=1.0).contains(&width) { return Err(err("Invalid healing stroke.")); }
+        let base = self.scaled_source(id, max_dim)?;
+        let small = fit(base, 512, FilterType::Triangle);
+        let (dx, dy) = ops::suggest_offset(&small, points, width);
+        Ok(serde_json::to_string(&[dx, dy]).unwrap())
     }
 
     pub fn remove_image(&mut self, id: &str) {
@@ -131,6 +202,8 @@ impl Editor {
             l.wipe();
         }
         self.layers.clear();
+        for f in self.fonts.values_mut() { f.bytes.fill(0); }
+        self.fonts.clear();
         self.recent.clear();
         self.scaled = None;
         self.preview = RgbaImage::new(1, 1);
@@ -241,7 +314,7 @@ impl Editor {
             .ops
             .iter()
             .filter(|o| {
-                !matches!(o, Op::Layer { .. } | Op::Text { .. } | Op::BaseOpacity { .. } | Op::Levels { .. } | Op::Curves { .. } | Op::Paint { .. } | Op::Shapes { .. } | Op::Gradient { .. })
+                !matches!(o, Op::Layer { .. } | Op::Group { .. } | Op::Text { .. } | Op::BaseOpacity { .. } | Op::Levels { .. } | Op::Curves { .. } | Op::Paint { .. } | Op::Shapes { .. } | Op::Gradient { .. })
             })
             .cloned()
             .collect();
@@ -274,7 +347,7 @@ impl Editor {
     }
 
     pub fn save_bundle(&self) -> Result<Vec<u8>, JsValue> {
-        project::write_bundle(&self.layers).map_err(err)
+        project::write_bundle(&self.layers, &self.fonts).map_err(err)
     }
 
     /// Replaces the current session wholesale, wiping what was there first.
@@ -282,7 +355,7 @@ impl Editor {
         // Parse and validate before destroying anything, so a bad file leaves
         // your work intact. Each image is decoded once to prove it is sound,
         // then released, so memory peaks at one image rather than all of them.
-        let mut loaded = project::read_bundle(bytes).map_err(err)?;
+        let (mut loaded, fonts) = project::read_bundle(bytes).map_err(err)?;
         for l in loaded.iter_mut() {
             l.decode().map_err(err)?;
             l.evict();
@@ -297,6 +370,8 @@ impl Editor {
             l.id = fresh;
         }
         self.layers = loaded;
+        for (id, f) in &fonts { ops::text::register(&format!("{id}:r"), &f.bytes).map_err(err)?; }
+        self.fonts = fonts;
         Ok(())
     }
 
@@ -368,6 +443,12 @@ impl Default for Editor {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn parse_selection(json: &str) -> Result<ops::Selection, JsValue> {
+    let sel: ops::Selection = serde_json::from_str(json).map_err(|e| err(format!("Bad selection: {e}")))?;
+    ops::select::check(&sel).map_err(err)?;
+    Ok(sel)
 }
 
 pub(crate) fn fit(img: &RgbaImage, max_dim: u32, filter: FilterType) -> RgbaImage {

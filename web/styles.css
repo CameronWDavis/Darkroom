@@ -795,3 +795,22 @@ body.v-exporting .vtimeline { opacity:1; }
 .layer-section input[type=number] { min-width: 0; width: 100%; }
 .layer-section .check { margin: 8px 0; }
 .art-row button { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Guides, grid, selection outline and handles drawn over the image. */
+.hud { position:absolute; left:0; top:0; pointer-events:none; z-index:2; image-rendering:pixelated; }
+.ink { z-index:1; }
+.art-row .twisty { flex:0 0 auto; width:22px; padding:4px 0; text-align:center; }
+.art-row .btn.clipped { border-left:3px solid var(--amber-dim); }
+.art-row .btn.multi[aria-pressed="false"] { border-color:var(--amber-dim); background:#2b2820; }
+.align-seg { display:grid; gap:6px; margin-bottom:6px; }
+.align-seg .btn { font-size:15px; padding:5px 0; }
+.guide-list { list-style:none; margin:8px 0; padding:0; max-height:140px; overflow:auto; font-size:12px; }
+.guide-list li { display:flex; align-items:center; gap:6px; margin:4px 0; }
+.guide-list li span { flex:0 0 74px; color:var(--muted); }
+.guide-list input { flex:1; min-width:0; padding:4px 6px; color:var(--text); background:var(--ink); border:1px solid var(--line); border-radius:3px; font:inherit; }
+.guide-list .btn { padding:2px 8px; }
+.flush-field { margin:0; }
+.tool-bar .seg.four { margin-bottom:0; display:grid; }
+/* Fifteen tools no longer fit a short window; let the rail scroll. */
+.tool-rail { overflow-y:auto; scrollbar-width:none; }
+.tool-rail .btn { flex:none; }

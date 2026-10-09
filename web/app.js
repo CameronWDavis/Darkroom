@@ -40,6 +40,7 @@ const blank = () => ({
   filterColor: "#ec8a00", filterDensity: 0,
   noise: 0, noiseMono: false, vignette: 0, pixelate: 0, posterize: 1, threshold: 0,
   gradients: [], shapes: [], strokes: [], lasso: null, artLayers: [], baseOpacity: 1,
+  guides: { x: [], y: [] }, selection: null,
 });
 
 // Every slider in the panel, generated so the range, label and default live in
@@ -73,64 +74,237 @@ const sliderFmt = (key, v) => (SLIDERS.find((s) => s[1] === key)[5] || String)(v
 
 // Overlay layers are part of the operation stream, so history, thumbnails,
 // full-resolution exports and .darkroom bundles all use the same compositor.
-let selectedArt = null, textTool = false;
+// Layers and groups form a tree: a group's `children` are a stack of their own,
+// bottom first, exactly as the engine composites them.
+let selectedArt = null, selectedSet = new Set(), textTool = false;
+const MAX_LAYERS = 128;
+const ICONS = { text: "T", photo: "▧", adjustment: "◐", fill: "■", source: "▣", retouch: "✚", paint: "✎", shapes: "◇", gradient: "◫", group: "▤" };
 const makeArt = (name, content) => {
   const blend = content.op === "gradient" ? content.blend : "normal";
   if (content.op === "gradient") content = { ...content, blend: "normal" };
   return { op: "layer", id: crypto.randomUUID(), name, visible: true, opacity: 1, blend, content };
 };
-function addArt(a, name, content) { const layer = makeArt(name, content); a.artLayers.push(layer); selectedArt = layer.id; return layer; }
-const selectedArtLayer = () => adjust.get(activeId)?.artLayers.find(l => l.id === selectedArt);
-const artCount = (a, kind) => a.artLayers.reduce((n, l) => n + (l.content.op === kind ? (kind === "paint" ? l.content.strokes.length : kind === "shapes" ? l.content.items.length : 1) : 0), 0);
+function* walkArt(list, parent = null, depth = 0) {
+  for (const layer of list) {
+    yield { layer, list, parent, depth };
+    if (layer.op === "group") yield* walkArt(layer.children, layer, depth + 1);
+  }
+}
+const allArt = (a) => [...walkArt(a.artLayers)].map((e) => e.layer);
+function findArt(a, id) { for (const e of walkArt(a.artLayers)) if (e.layer.id === id) return e; return null; }
+const isGroup = (l) => l?.op === "group";
+const kindOf = (l) => (isGroup(l) ? "group" : l.content.op);
+const kindIs = (l, kind) => !!l && kindOf(l) === kind;
+/** Layers with pixels of their own, which transform, align and snap. */
+const movable = (l) => !!l && !isGroup(l) && !["adjustment", "retouch"].includes(l.content.op);
+/** The space a layer's mask is painted in: its own when it can be transformed. */
+const maskSpace = (l) => (movable(l) ? l.transform : null);
+function roomFor(a, n = 1) {
+  if (allArt(a).length + n <= MAX_LAYERS) return true;
+  say(`An image can hold up to ${MAX_LAYERS} layers and groups.`, true);
+  return false;
+}
+function selectArt(id, { add = false } = {}) {
+  if (!add) { selectedArt = id; selectedSet = new Set(id ? [id] : []); return; }
+  if (selectedSet.has(id) && selectedSet.size > 1) {
+    selectedSet.delete(id);
+    if (selectedArt === id) selectedArt = [...selectedSet].pop();
+  } else { selectedSet.add(id); selectedArt = id; }
+}
+/** Selected ids, leaving out anything inside a selected group. */
+function topLevelSelection(a) {
+  return [...selectedSet].filter((id) => {
+    let e = findArt(a, id);
+    if (!e) return false;
+    while (e.parent) { if (selectedSet.has(e.parent.id)) return false; e = findArt(a, e.parent.id); }
+    return true;
+  });
+}
+/** New layers go just above the selected one, inside the same group. */
+function insertArt(a, layer) {
+  const at = selectedArt && findArt(a, selectedArt);
+  if (at) {
+    const i = at.list.indexOf(at.layer);
+    // Inside a clipping run, a new layer joins the run.
+    if (at.list[i + 1]?.clip) layer.clip = true;
+    at.list.splice(i + 1, 0, layer);
+  } else a.artLayers.push(layer);
+  selectArt(layer.id);
+  return layer;
+}
+function addArt(a, name, content) { return insertArt(a, makeArt(name, content)); }
+const pruneArt = (list, drop) => list.filter((l) => !drop(l)).map((l) => (isGroup(l) ? { ...l, children: pruneArt(l.children, drop) } : l));
+const selectedArtLayer = () => { const a = adjust.get(activeId); return a && selectedArt ? findArt(a, selectedArt)?.layer : undefined; };
+const artCount = (a, kind) => allArt(a).reduce((n, l) => n + (!isGroup(l) && l.content.op === kind ? (kind === "paint" ? l.content.strokes.length : kind === "shapes" ? l.content.items.length : 1) : 0), 0);
+const textChars = (a, except) => allArt(a).reduce((n, l) => n + (l.id !== except && !isGroup(l) && l.content.op === "text" ? [...l.content.text].length : 0), 0);
+/** Applies a change only when the engine accepts the result, so limits such as
+ *  group depth are enforced by the validator that also guards save and open. */
+function structural(label, change) {
+  const a = adjust.get(activeId); if (!a) return;
+  // The trial run may select what it creates; the real run must start from
+  // the same selection.
+  const keep = [selectedArt, [...selectedSet]], restore = () => { selectedArt = keep[0]; selectedSet = new Set(keep[1]); };
+  const candidate = structuredClone(a);
+  const outcome = change(candidate);
+  restore();
+  if (outcome === false) return;
+  try { ed.set_ops(activeId, JSON.stringify(buildOps(candidate))); } catch (e) { return fail(e); }
+  edit(label, (s) => change(s));
+  syncControls();
+}
+/** Photoshop-style stepping: a layer enters an open group it meets, and leaves
+ *  its group at either end. */
+function moveArt(s, id, dir) {
+  const at = findArt(s, id); if (!at) return false;
+  const { list, parent, layer } = at;
+  const i = list.indexOf(layer), j = i + dir;
+  if (j < 0 || j >= list.length) {
+    if (!parent) return false;
+    const outer = findArt(s, parent.id);
+    list.splice(i, 1);
+    const k = outer.list.indexOf(parent);
+    outer.list.splice(dir > 0 ? k + 1 : k, 0, layer);
+    return true;
+  }
+  const neighbour = list[j];
+  if (isGroup(neighbour) && !neighbour.collapsed) {
+    list.splice(i, 1);
+    if (dir > 0) neighbour.children.unshift(layer); else neighbour.children.push(layer);
+    return true;
+  }
+  [list[i], list[j]] = [list[j], list[i]];
+  return true;
+}
+function canMoveArt(a, l, dir) {
+  const at = findArt(a, l.id); if (!at) return false;
+  const j = at.list.indexOf(l) + dir;
+  return (j >= 0 && j < at.list.length) || !!at.parent;
+}
+function groupSelected(s, gid) {
+  const ids = topLevelSelection(s); if (!ids.length) return false;
+  const order = [...walkArt(s.artLayers)].map((e) => e.layer.id);
+  ids.sort((p, q) => order.indexOf(p) - order.indexOf(q));
+  const anchor = findArt(s, ids.includes(selectedArt) ? selectedArt : ids[ids.length - 1]);
+  const home = anchor.list;
+  let index = home.indexOf(anchor.layer);
+  index -= home.slice(0, index).filter((l) => ids.includes(l.id)).length;
+  const members = ids.map((id) => findArt(s, id).layer);
+  for (const m of members) { const e = findArt(s, m.id); e.list.splice(e.list.indexOf(m), 1); }
+  home.splice(index, 0, { op: "group", id: gid, name: "Group", visible: true, opacity: 1, blend: "normal", pass_through: true, children: members, mask: null, clip: false, collapsed: false });
+  selectArt(gid);
+}
+function ungroup(s, id) {
+  const e = findArt(s, id); if (!isGroup(e?.layer)) return false;
+  e.list.splice(e.list.indexOf(e.layer), 1, ...e.layer.children);
+  selectArt(e.layer.children.at(-1)?.id ?? null);
+  for (const c of e.layer.children) selectedSet.add(c.id);
+}
+/** A deep copy with fresh ids for the layer and everything inside it. */
+function freshCopy(l) {
+  const copy = structuredClone(l);
+  (function reid(x) { x.id = crypto.randomUUID(); if (isGroup(x)) x.children.forEach(reid); })(copy);
+  copy.name = (l.name + " copy").slice(0, 64);
+  return copy;
+}
+
 function renderArtPanel() {
   const a = adjust.get(activeId); if (!a) return;
+  for (const id of [...selectedSet]) if (!findArt(a, id)) selectedSet.delete(id);
+  if (selectedArt && !findArt(a, selectedArt)) selectedArt = null;
+  if (selectedArt) selectedSet.add(selectedArt); else selectedSet.clear();
   const list = $("art-layers"); list.replaceChildren();
-  for (const layer of [...a.artLayers].reverse()) {
-    const row = document.createElement("div"); row.className = "art-row";
-    const visible = document.createElement("input"); visible.type = "checkbox"; visible.checked = layer.visible;
-    visible.setAttribute("aria-label", `Show ${layer.name}`);
-    visible.onchange = () => { edit("Layer visibility", () => layer.visible = visible.checked); syncControls(); };
-    const select = document.createElement("button"); select.className = "btn sm";
-    select.textContent = `${({text:"T",photo:"▧",adjustment:"◐"})[layer.content.op] || "◇"}  ${layer.name}${layer.mask ? " ◑" : ""}`;
-    select.setAttribute("aria-pressed", String(selectedArt === layer.id));
-    select.onclick = () => { leaveTools(); selectedArt = layer.id; renderArtPanel(); if (layer.content.op === "text") activateTool("text"); else if (layer.content.op !== "adjustment") activateTool("transform"); };
-    row.append(visible, select); list.append(row);
-  }
+  const rows = (items, depth) => {
+    for (const layer of [...items].reverse()) {
+      const row = document.createElement("div"); row.className = "art-row";
+      row.style.paddingLeft = `${depth * 14}px`;
+      const visible = document.createElement("input"); visible.type = "checkbox"; visible.checked = layer.visible;
+      visible.setAttribute("aria-label", `Show ${layer.name}`);
+      visible.onchange = () => { edit("Layer visibility", () => layer.visible = visible.checked); syncControls(); };
+      row.append(visible);
+      if (isGroup(layer)) {
+        const twisty = document.createElement("button"); twisty.className = "btn sm twisty";
+        twisty.textContent = layer.collapsed ? "▸" : "▾";
+        twisty.setAttribute("aria-label", `${layer.collapsed ? "Expand" : "Collapse"} ${layer.name}`);
+        twisty.setAttribute("aria-expanded", String(!layer.collapsed));
+        // Folding is view state: it saves with the project but is not an edit.
+        twisty.onclick = () => { layer.collapsed = !layer.collapsed; renderArtPanel(); };
+        row.append(twisty);
+      }
+      const select = document.createElement("button"); select.className = "btn sm";
+      select.textContent = `${layer.clip ? "↳ " : ""}${ICONS[kindOf(layer)] || "◇"}  ${layer.name}${layer.mask ? " ◑" : ""}`;
+      if (layer.clip) { select.classList.add("clipped"); select.title = "Clipped to the layer below"; }
+      select.setAttribute("aria-pressed", String(selectedArt === layer.id));
+      if (selectedSet.has(layer.id) && selectedArt !== layer.id) select.classList.add("multi");
+      select.onclick = (e) => {
+        const add = e.shiftKey || e.ctrlKey || e.metaKey;
+        leaveTools(); selectArt(layer.id, { add }); renderArtPanel();
+        if (add) return;
+        if (kindOf(layer) === "text") activateTool("text");
+        else if (movable(layer) || isGroup(layer)) activateTool("transform");
+      };
+      row.append(select); list.append(row);
+      if (isGroup(layer) && !layer.collapsed) rows(layer.children, depth + 1);
+    }
+  };
+  rows(a.artLayers, 0);
   const base = document.createElement("button"); base.className = "btn sm wide";
   base.textContent = "▧  Original photo"; base.setAttribute("aria-pressed", String(!selectedArtLayer()));
-  base.onclick = () => { leaveTools(); selectedArt = null; renderArtPanel(); }; list.append(base);
-  const layer = selectedArtLayer(), text = layer?.content.op === "text" ? layer.content : null;
+  base.onclick = () => { leaveTools(); selectArt(null); renderArtPanel(); }; list.append(base);
+  const multi = topLevelSelection(a).length;
+  $("layer-multi").hidden = multi < 2;
+  $("layer-multi").textContent = `${multi} layers selected — group, align, distribute or delete them together. Properties below are for the highlighted one.`;
+
+  const layer = selectedArtLayer(), kind = layer && kindOf(layer), text = kind === "text" ? layer.content : null;
   $("layer-name").disabled = !layer; $("layer-name").value = layer?.name || "Original photo";
   $("layer-opacity").value = Math.round((layer?.opacity ?? a.baseOpacity)*100);
   $("layer-opacity-value").textContent = `${$("layer-opacity").value}%`;
-  $("layer-blend").disabled = !layer; $("layer-blend").value = layer?.blend || "normal";
-  for (const id of ["layer-up", "layer-down", "layer-duplicate", "layer-delete"]) $(id).disabled = !layer;
-  if (layer) { $("layer-up").disabled = a.artLayers.indexOf(layer) === a.artLayers.length-1; $("layer-down").disabled = a.artLayers.indexOf(layer) === 0; }
+  const blend = $("layer-blend"), through = blend.querySelector('option[value="pass_through"]');
+  if (isGroup(layer) && !through) blend.prepend(new Option("Pass through", "pass_through"));
+  if (!isGroup(layer) && through) through.remove();
+  blend.disabled = !layer || kind === "adjustment" || kind === "retouch";
+  blend.value = isGroup(layer) && layer.pass_through ? "pass_through" : layer?.blend || "normal";
+  for (const id of ["layer-up", "layer-down", "layer-duplicate", "layer-delete", "layer-group", "layer-clip"]) $(id).disabled = !layer;
+  if (layer) { $("layer-up").disabled = !canMoveArt(a, layer, 1); $("layer-down").disabled = !canMoveArt(a, layer, -1); }
+  $("layer-ungroup").disabled = !isGroup(layer);
+  $("layer-clip").setAttribute("aria-pressed", String(!!layer?.clip));
+  if (layer) $("layer-clip").disabled = !layer.clip && findArt(a, layer.id).list.indexOf(layer) === 0;
   renderLayerExtras(layer);
   $("text-properties").hidden = !text;
   if (text) {
-    $("text-content").value = text.text; $("text-bold").checked = text.bold;
+    renderFontOptions(text.font || "lato");
+    $("text-content").value = text.text; $("text-bold").checked = text.bold; $("text-italic").checked = !!text.italic;
     $("text-color").value = rgbToHex(text.color.slice(0,3)); $("text-align").value = text.align;
     $("text-size").value = +(text.size*100).toFixed(2); $("text-leading").value = text.leading;
     $("text-x").value = +(text.x*100).toFixed(2); $("text-y").value = +(text.y*100).toFixed(2);
+    $("text-tracking").value = Math.round((text.tracking || 0) * 1000);
+    $("text-box").checked = text.box_width > 0; $("text-box-field").hidden = !(text.box_width > 0);
+    $("text-box-width").value = +((text.box_width || 0) * 100).toFixed(2);
   }
 }
-function addTextLayer() {
+function addTextLayer(at = null) {
   if (!activeId) return say("Import an image first.");
-  const a = adjust.get(activeId); if (a.artLayers.length >= 128) return say("An image can hold up to 128 layers.", true);
-  if(a.artLayers.reduce((n,l)=>n+(l.content.op==="text" ? [...l.content.text].length : 0),0) > 3991) return say("An image can hold up to 4000 text characters.",true);
-  edit("Add text layer", s => addArt(s, "Text", { op: "text", text: "Your text", x: .5, y: .4, size: .08, color: [255,255,255,255], bold: false, align: "center", leading: 1.2 }));
+  const a = adjust.get(activeId); if (!roomFor(a)) return;
+  if(textChars(a) > 3991) return say("An image can hold up to 4000 text characters.",true);
+  const content = { op: "text", text: "Your text", x: .5, y: .4, size: .08, color: [255,255,255,255], bold: false, align: "center", leading: 1.2, font: "lato", italic: false, tracking: 0, box_width: 0, ...at };
+  edit("Add text layer", s => addArt(s, "Text", content));
   leaveTools(); activateTool("text"); syncControls();
   $("text-content").focus(); $("text-content").select();
 }
-$("layer-add-text").onclick = addTextLayer;
+$("layer-add-text").onclick = () => addTextLayer();
 $("layer-add-paint").onclick = () => {
-  if (!activeId || adjust.get(activeId).artLayers.length >= 128) return say("An image can hold up to 128 layers.", true);
+  if (!activeId || !roomFor(adjust.get(activeId))) return;
   edit("Add drawing layer", a => addArt(a, "Drawing", { op: "paint", strokes: [] }));
   leaveTools(); activateTool("paint"); syncControls();
 };
 $("layer-name").onchange = e => { const l = selectedArtLayer(); if (l) { edit("Rename layer", () => l.name = e.target.value.trim().slice(0,64) || "Layer"); syncControls(); } };
-$("layer-blend").onchange = e => { const l = selectedArtLayer(); if (l) { edit("Layer blend mode", () => l.blend = e.target.value); syncControls(); } };
+$("layer-blend").onchange = e => {
+  const l = selectedArtLayer(); if (!l) return;
+  edit("Layer blend mode", () => {
+    if (isGroup(l)) { l.pass_through = e.target.value === "pass_through"; if (!l.pass_through) l.blend = e.target.value; }
+    else l.blend = e.target.value;
+  });
+  syncControls();
+};
 let propertyGesture = null;
 function propertyInput(id, apply) {
   $(id).addEventListener("input", () => {
@@ -142,68 +316,191 @@ function propertyInput(id, apply) {
   $(id).addEventListener("change", () => { propertyGesture = null; syncControls(); requestAnimationFrame(refreshLayers); });
 }
 propertyInput("layer-opacity", e => { const l = selectedArtLayer(), value = Number(e.value)/100; if(l) l.opacity=value; else adjust.get(activeId).baseOpacity=value; $("layer-opacity-value").textContent=`${e.value}%`; });
-const updateText = fn => { const l=selectedArtLayer(); if(l?.content.op === "text") fn(l.content); };
+const updateText = fn => { const l=selectedArtLayer(); if(l && kindOf(l) === "text") fn(l.content); };
 propertyInput("text-content", e => updateText(t => {
-  const others=adjust.get(activeId).artLayers.reduce((n,l)=>n+(l.id!==selectedArt && l.content.op==="text" ? [...l.content.text].length : 0),0);
+  const others=textChars(adjust.get(activeId), selectedArt);
   t.text=[...e.value.split("\n").slice(0,50).join("\n")].slice(0,Math.min(1000,4000-others)).join("");
 }));
 propertyInput("text-color", e => updateText(t => t.color=[...hexToRgb(e.value),255]));
-propertyInput("text-bold", e => updateText(t => t.bold=e.checked));
-propertyInput("text-align", e => updateText(t => t.align=e.value));
+propertyInput("text-bold", e => { updateText(t => t.bold=e.checked); loadFontsThenRender(); });
+propertyInput("text-italic", e => { updateText(t => t.italic=e.checked); loadFontsThenRender(); });
+propertyInput("text-align", e => updateText(t => {
+  // A paragraph box anchors at its left edge; point text at its alignment.
+  if (!(t.box_width > 0)) t.x = clamp(t.x + anchorShift(t.align, e.value === "justify" ? "left" : e.value, textWidth()), 0, 1);
+  t.align=e.value;
+}));
+propertyInput("text-tracking", e => updateText(t => t.tracking = clamp(Number(e.value) || 0, -500, 2000) / 1000));
+propertyInput("text-box", e => updateText(t => {
+  const width = textWidth();
+  if (e.checked) { const bw = clamp(width || .4, .02, 1); t.x = clamp(t.x + anchorShift(t.align, "left", bw), 0, 1); t.box_width = bw; }
+  else { t.x = clamp(t.x - anchorShift(t.align, "left", t.box_width), 0, 1); t.box_width = 0; if (t.align === "justify") t.align = "left"; }
+}));
+propertyInput("text-box-width", e => updateText(t => { if (t.box_width > 0) t.box_width = clamp(Number(e.value) || 1, 1, 100) / 100; }));
 for(const [id,key,lo,hi,factor] of [["text-size","size",.1,25,100],["text-leading","leading",.5,3,1],["text-x","x",0,100,100],["text-y","y",0,100,100]]) {
   propertyInput(id,e=>updateText(t=>t[key]=clamp(Number(e.value)||lo,lo,hi)/factor));
 }
+/** Horizontal move that keeps text in place when its anchor changes. */
+function anchorShift(from, to, width) {
+  const offset = { left: 0, justify: 0, center: .5, right: 1 };
+  return (offset[from] - offset[to]) * width;
+}
+/** Width of the selected text's content, in normalized source units. */
+function textWidth() { const l = selectedArtLayer(); try { return l ? layerBounds(l)[2] : 0; } catch { return 0; } }
 for(const [id,delta] of [["layer-up",1],["layer-down",-1]]) $(id).onclick=()=>{
-  const a=adjust.get(activeId), l=selectedArtLayer(); if(!l)return;
-  const i=a.artLayers.indexOf(l), j=i+delta; if(j<0 || j>=a.artLayers.length)return;
-  edit("Reorder layer",()=>[a.artLayers[i],a.artLayers[j]]=[a.artLayers[j],a.artLayers[i]]); syncControls();
+  const l=selectedArtLayer(); if(l) structural("Reorder layer", s => moveArt(s, l.id, delta));
 };
 $("layer-duplicate").onclick=()=>{
   const a=adjust.get(activeId), l=selectedArtLayer(); if(!l)return;
-  if(a.artLayers.length>=128)return say("An image can hold up to 128 layers.",true);
-  const copy=structuredClone(l); copy.id=crypto.randomUUID(); copy.name=(l.name+" copy").slice(0,64);
+  const copy=freshCopy(l); if(!roomFor(a, allArt({artLayers:[copy]}).length))return;
   // Ask the same engine validator used by save/open before committing limits.
-  try { ed.set_ops(activeId,JSON.stringify([...buildOps(a),copy])); } catch(e) { return fail(e); }
-  edit("Duplicate layer",()=>{ a.artLayers.splice(a.artLayers.indexOf(l)+1,0,copy); selectedArt=copy.id; }); syncControls();
+  structural("Duplicate layer", s => { const e=findArt(s,l.id); e.list.splice(e.list.indexOf(e.layer)+1,0,structuredClone(copy)); selectArt(copy.id); });
 };
-$("layer-delete").onclick=()=>{ const l=selectedArtLayer(); if(!l)return; leaveTools(); edit("Delete layer",a=>a.artLayers=a.artLayers.filter(x=>x.id!==l.id)); selectedArt=null; syncControls(); };
-let typeDrag = null;
+$("layer-delete").onclick=()=>{
+  const a=adjust.get(activeId); if(!a || !selectedArtLayer())return;
+  const ids=topLevelSelection(a); leaveTools();
+  edit(ids.length>1?"Delete layers":"Delete layer",s=>{ for(const id of ids){ const e=findArt(s,id); if(e) e.list.splice(e.list.indexOf(e.layer),1); } });
+  selectArt(null); syncControls();
+};
+function groupLayers() {
+  const a=adjust.get(activeId); if(!a || !selectedArtLayer())return say("Select the layers to group first.");
+  if(!roomFor(a))return;
+  const gid=crypto.randomUUID(); structural("Group layers", s => groupSelected(s, gid));
+}
+function ungroupLayers() { const l=selectedArtLayer(); if(isGroup(l)) structural("Ungroup", s => ungroup(s, l.id)); }
+function toggleClip() {
+  const l=selectedArtLayer(); if(!l)return;
+  const at=findArt(adjust.get(activeId),l.id);
+  if(!l.clip && at.list.indexOf(l)===0)return say("A layer clips to the layer directly below it. Move it above another layer first.");
+  edit(l.clip?"Release clipping mask":"Create clipping mask",()=>l.clip=!l.clip); syncControls();
+}
+$("layer-group").onclick=groupLayers;
+$("layer-ungroup").onclick=ungroupLayers;
+$("layer-clip").onclick=toggleClip;
+
+// --- text tool on the canvas ----------------------------------------------
+// Drag the selected text to move it, or its paragraph box's edge handle to
+// rewrap. With no text selected, click to place point text or drag out a box.
+let typeDrag = null, typeCreate = null;
+function canvasPoint(e) { const r=$("canvas").getBoundingClientRect(); return [(e.clientX-r.left)/r.width,(e.clientY-r.top)/r.height]; }
 $("canvas").addEventListener("pointerdown", e => {
   if(!textTool || panning() || e.button!==0)return;
-  const l=selectedArtLayer(); if(l?.content.op!=="text") { addTextLayer(); return; }
-  if(!l.visible)return say("Show this layer before positioning it.");
-  const r=$("canvas").getBoundingClientRect(), a=adjust.get(activeId);
-  const [x,y]=screenToSource((e.clientX-r.left)/r.width,(e.clientY-r.top)/r.height,a);
-  pushHistory("Move text"); typeDrag={x,y,startX:l.content.x,startY:l.content.y};
+  const a=adjust.get(activeId), l=selectedArtLayer(), out=canvasPoint(e), [x,y]=screenToSource(...out,a);
   $("canvas").setPointerCapture(e.pointerId); e.preventDefault();
+  if(!kindIs(l,"text")) { typeCreate={x,y,cx:e.clientX,cy:e.clientY}; return; }
+  if(!l.visible)return say("Show this layer before positioning it.");
+  const frame=textFrame(l,a), r=$("canvas").getBoundingClientRect();
+  if(frame && Math.hypot((frame.handle[0]-out[0])*r.width,(frame.handle[1]-out[1])*r.height)<12) {
+    pushHistory("Resize text box"); typeDrag={box:true}; return;
+  }
+  pushHistory("Move text"); typeDrag={x,y,startX:l.content.x,startY:l.content.y};
 });
 $("canvas").addEventListener("pointermove",e=>{
   if(!typeDrag)return;
-  const r=$("canvas").getBoundingClientRect(), a=adjust.get(activeId);
-  const [x,y]=screenToSource((e.clientX-r.left)/r.width,(e.clientY-r.top)/r.height,a);
-  const l=selectedArtLayer(), p=layerLocal(x,y,l?.transform), q=layerLocal(typeDrag.x,typeDrag.y,l?.transform);
+  const a=adjust.get(activeId), [x,y]=screenToSource(...canvasPoint(e),a), l=selectedArtLayer();
+  if(typeDrag.box) { const p=layerLocal(x,y,l?.transform); updateText(t=>t.box_width=clamp(p[0]-t.x,.01,1)); scheduleRender(); return; }
+  const p=layerLocal(x,y,l?.transform), q=layerLocal(typeDrag.x,typeDrag.y,l?.transform);
   updateText(t=>{t.x=clamp(typeDrag.startX+p[0]-q[0],0,1);t.y=clamp(typeDrag.startY+p[1]-q[1],0,1);}); scheduleRender();
 });
-for(const event of ["pointerup","pointercancel"]) $("canvas").addEventListener(event,()=>{ if(typeDrag){typeDrag=null;syncControls();requestAnimationFrame(refreshLayers);} });
+for(const event of ["pointerup","pointercancel"]) $("canvas").addEventListener(event,e=>{
+  if(typeCreate) {
+    const start=typeCreate; typeCreate=null; if(event==="pointercancel")return;
+    const [x,y]=screenToSource(...canvasPoint(e),adjust.get(activeId));
+    const at={x:clamp(Math.min(start.x,x),0,1),y:clamp(Math.min(start.y,y),0,1),align:"left",size:.05};
+    if(Math.hypot(e.clientX-start.cx,e.clientY-start.cy)>8) at.box_width=clamp(Math.abs(x-start.x),.02,1);
+    else { at.x=clamp(start.x,0,1); at.y=clamp(start.y,0,1); }
+    addTextLayer(at); return;
+  }
+  if(typeDrag){typeDrag=null;syncControls();requestAnimationFrame(refreshLayers);}
+});
+
+// --- fonts -------------------------------------------------------------------
+// Lato is compiled into the engine. The other bundled families are fetched the
+// first time a text layer uses them; imported fonts live in the engine and are
+// saved inside projects that use them.
+const FONT_FAMILIES = {
+  lato: { name: "Lato", files: {} },
+  rubik: { name: "Rubik", files: { r: "Rubik-Regular.ttf", b: "Rubik-Bold.ttf", i: "Rubik-Italic.ttf", bi: "Rubik-BoldItalic.ttf" } },
+  caladea: { name: "Caladea (serif)", files: { r: "Caladea-Regular.ttf", b: "Caladea-Bold.ttf", i: "Caladea-Italic.ttf", bi: "Caladea-BoldItalic.ttf" } },
+  "liberation-mono": { name: "Liberation Mono", files: { r: "LiberationMono-Regular.ttf", b: "LiberationMono-Bold.ttf", i: "LiberationMono-Italic.ttf", bi: "LiberationMono-BoldItalic.ttf" } },
+};
+let wasmMod = null, userFonts = [];
+const fontLoads = new Map();
+const faceKey = (t) => `${t.font || "lato"}:${t.bold ? (t.italic ? "bi" : "b") : (t.italic ? "i" : "r")}`;
+const faceFile = (key) => { const [family, style] = [key.slice(0, key.lastIndexOf(":")), key.slice(key.lastIndexOf(":") + 1)]; return FONT_FAMILIES[family]?.files[style]; };
+function loadFace(key) {
+  if (!fontLoads.has(key)) {
+    fontLoads.set(key, fetch(`fonts/${faceFile(key)}`)
+      .then((r) => { if (!r.ok) throw new Error(`Couldn't load the font file ${faceFile(key)}.`); return r.arrayBuffer(); })
+      .then((b) => wasmMod.register_font(key, new Uint8Array(b)))
+      .catch((e) => { fail(e); }));
+  }
+  return fontLoads.get(key);
+}
+/** Fetches any bundled faces the given documents' text needs. Resolves to
+ *  true when something new was loaded, so the caller can re-render. */
+async function ensureFonts(states = [...adjust.values()]) {
+  if (!wasmMod) return false;
+  const keys = new Set();
+  for (const a of states) for (const l of allArt(a)) if (kindOf(l) === "text") keys.add(faceKey(l.content));
+  const pending = [...keys].filter((k) => faceFile(k) && !wasmMod.font_ready(k));
+  if (!pending.length) return false;
+  await Promise.all(pending.map(loadFace));
+  return true;
+}
+function loadFontsThenRender() {
+  ensureFonts().then((loaded) => { if (loaded) { scheduleRender(); requestAnimationFrame(refreshLayers); } });
+}
+function renderFontOptions(current) {
+  const select = $("text-font"); select.replaceChildren();
+  for (const [id, f] of Object.entries(FONT_FAMILIES)) select.append(new Option(f.name, id));
+  for (const f of userFonts) select.append(new Option(`${f.name} (imported)`, f.id));
+  select.append(new Option("Import font…", "__import__"));
+  if (![...select.options].some((o) => o.value === current)) select.append(new Option("Missing font (shows as Lato)", current));
+  select.value = current;
+}
+$("text-font").onchange = (e) => {
+  const value = e.target.value;
+  if (value === "__import__") { renderFontOptions(selectedArtLayer()?.content.font || "lato"); $("file-font").click(); return; }
+  const l = selectedArtLayer(); if (!kindIs(l, "text")) return;
+  edit("Font", () => (l.content.font = value)); syncControls(); loadFontsThenRender();
+};
+$("file-font").onchange = async (e) => {
+  const file = e.target.files[0]; e.target.value = ""; if (!file) return;
+  if (file.size > 20 * 1024 * 1024) return say("Font files are limited to 20 MB.", true);
+  try {
+    const id = "user:" + crypto.randomUUID(), name = file.name.replace(/\.(ttf|otf)$/i, "").slice(0, 60) || "Imported font";
+    ed.add_font(id, name, new Uint8Array(await file.arrayBuffer()));
+    userFonts = JSON.parse(ed.fonts_json());
+    const l = selectedArtLayer();
+    if (kindIs(l, "text")) edit("Font", () => (l.content.font = id));
+    syncControls();
+    say(`Imported ${name}. Projects that use it carry a copy of the font file.`);
+  } catch (error) { fail(error); }
+};
 
 // --- editable photo layers, transforms, masks and layer effects ------------
 const identityTransform = () => ({tx:0,ty:0,sx:1,sy:1,rotation:0,anchor_x:.5,anchor_y:.5});
-const defaultStyle = () => ({shadow:false,shadow_color:[0,0,0,160],shadow_blur:.015,shadow_x:.02,shadow_y:.02,outline:false,outline_color:[255,255,255,255],outline_width:.005});
+const defaultStyle = () => ({shadow:false,shadow_color:[0,0,0,160],shadow_blur:.015,shadow_x:.02,shadow_y:.02,outline:false,outline_color:[255,255,255,255],outline_width:.005,
+  glow:false,glow_color:[255,214,120,190],glow_size:.02,inner_glow:false,inner_glow_color:[255,255,255,170],inner_glow_size:.01,
+  bevel:false,bevel_size:.01,bevel_depth:1,bevel_angle:120,bevel_highlight:[255,255,255,190],bevel_shadow:[0,0,0,170]});
+/** The layer's style with any fields older projects lack filled in. */
+const styleOf = (l) => (l.style = { ...defaultStyle(), ...(l.style || {}) });
 const adjustmentKeys = ['exposure','brightness','contrast','saturation','warmth'];
-let layerTool = null, layerDrag = null, maskStroke = null, maskCursor = null;
+let layerTool = null, layerDrag = null, maskStroke = null, maskCursor = null, guideDrag = null;
 const boundsCache = new Map();
 function layerBounds(l) {
-  const key=JSON.stringify([layerDimensions(),l.content]), old=boundsCache.get(l.id);
+  const shaped=['fill','source'].includes(l.content.op);
+  const key=JSON.stringify([layerDimensions(),l.content,shaped?l.mask:0]), old=boundsCache.get(l.id);
   if(old?.key===key) return old.bounds;
   ed.set_ops(activeId,JSON.stringify(buildOps(adjust.get(activeId))));
-  const bounds=JSON.parse(ed.overlay_bounds(activeId,l.id));
+  const bounds=JSON.parse(ed.overlay_bounds(activeId,l.id,previewCap()));
   if(boundsCache.size>256)boundsCache.clear();
   boundsCache.set(l.id,{key,bounds});return bounds;
 }
 function transformFor(l) {
   if(!l.transform || (l.transform.sx===1 && l.transform.sy===1 && l.transform.rotation===0)) {
     const [x,y,w,h]=layerBounds(l);
-    l.transform={...(l.transform||identityTransform()),anchor_x:x+w/2,anchor_y:y+h/2};
+    l.transform={...(l.transform||identityTransform()),anchor_x:clamp(x+w/2,0,1),anchor_y:clamp(y+h/2,0,1)};
   }
   return l.transform;
 }
@@ -219,19 +516,43 @@ function layerWorld(x,y,t) {
   const px=(x-t.anchor_x)*w*t.sx,py=(y-t.anchor_y)*h*t.sy;
   return [(px*c-py*s)/w+t.anchor_x+t.tx,(px*s+py*c)/h+t.anchor_y+t.ty];
 }
+/** Output-space bounding box of a layer or group, normalized to the frame. */
+function outBox(l, a) {
+  if (isGroup(l)) {
+    const boxes = l.children.filter((c) => c.visible).map((c) => outBox(c, a)).filter(Boolean);
+    return boxes.length ? unionBox(boxes) : null;
+  }
+  if (!movable(l)) return null;
+  const [x, y, w, h] = layerBounds(l);
+  const pts = [[x, y], [x + w, y], [x + w, y + h], [x, y + h]].map((p) => sourceToOut(...layerWorld(...p, l.transform), a));
+  return { x0: Math.min(...pts.map((p) => p[0])), y0: Math.min(...pts.map((p) => p[1])), x1: Math.max(...pts.map((p) => p[0])), y1: Math.max(...pts.map((p) => p[1])) };
+}
+const unionBox = (boxes) => ({ x0: Math.min(...boxes.map((b) => b.x0)), y0: Math.min(...boxes.map((b) => b.y0)), x1: Math.max(...boxes.map((b) => b.x1)), y1: Math.max(...boxes.map((b) => b.y1)) });
+/** A displacement on screen as a displacement in source coordinates. */
+function outDeltaToSource(dx, dy, a) { const p = screenToSource(.5, .5, a), q = screenToSource(.5 + dx, .5 + dy, a); return [q[0] - p[0], q[1] - p[1]]; }
+function translateArt(l, d) {
+  if (isGroup(l)) { l.children.forEach((c) => translateArt(c, d)); return; }
+  if (!movable(l)) return;
+  const t = transformFor(l); t.tx = clamp(t.tx + d[0], -2, 2); t.ty = clamp(t.ty + d[1], -2, 2);
+}
 function renderLayerExtras(l) {
   $('layer-extra').hidden=!l;if(!l)return;
-  const adjustment=l.content.op==='adjustment';
-  $('transform-properties').hidden=adjustment;$('style-properties').hidden=adjustment;
-  $('adjustment-properties').hidden=!adjustment;$('layer-blend').disabled=adjustment;
-  const t=l.transform||identityTransform(), style=l.style||defaultStyle();
+  const kind=kindOf(l), group=kind==='group';
+  $('transform-properties').hidden=!movable(l);$('style-properties').hidden=!movable(l);
+  $('adjustment-properties').hidden=kind!=='adjustment';
+  $('group-note').hidden=!group;$('retouch-note').hidden=kind!=='retouch';$('fill-properties').hidden=kind!=='fill';
+  if(kind==='fill')$('fill-color').value=rgbToHex(l.content.color.slice(0,3));
+  const t=l.transform||identityTransform(), style={...defaultStyle(),...(l.style||{})};
   for(const key of ['tx','ty','sx','sy','rotation']) $('transform-'+key).value=+(t[key]*(key==='rotation'?1:100)).toFixed(2);
-  for(const key of adjustmentKeys) { const v=Math.round((l.content[key]||0)*100);$('adjust-'+key).value=v;$('adjust-'+key+'-value').textContent=v; }
+  if(kind==='adjustment') for(const key of adjustmentKeys) { const v=Math.round((l.content[key]||0)*100);$('adjust-'+key).value=v;$('adjust-'+key+'-value').textContent=v; }
   $('mask-add').hidden=!!l.mask;$('mask-properties').hidden=!l.mask;
   if(l.mask) {$('mask-enabled').checked=l.mask.enabled;$('mask-inverted').checked=l.mask.inverted;}
-  for(const k of ['shadow','outline']) {$('style-'+k).checked=style[k];$('style-'+k+'-color').value=rgbToHex(style[k+'_color'].slice(0,3));}
-  $('style-shadow-opacity').value=Math.round(style.shadow_color[3]/255*100);
+  for(const k of ['shadow','outline','glow','inner_glow']) {$('style-'+k).checked=style[k];$('style-'+k+'-color').value=rgbToHex(style[k+'_color'].slice(0,3));}
+  for(const k of ['shadow','glow','inner_glow']) $('style-'+k+'-opacity').value=Math.round(style[k+'_color'][3]/255*100);
   for(const k of ['shadow_blur','shadow_x','shadow_y','outline_width']) $('style-'+k.replaceAll('_','-')).value=+(style[k]*100).toFixed(2);
+  for(const k of ['glow','inner_glow','bevel']) $('style-'+k+'-size').value=+(style[k+'_size']*100).toFixed(2);
+  $('style-bevel').checked=style.bevel;$('style-bevel-depth').value=Math.round(style.bevel_depth*100);$('style-bevel-angle').value=Math.round(style.bevel_angle);
+  $('style-bevel-highlight').value=rgbToHex(style.bevel_highlight.slice(0,3));$('style-bevel-shadow').value=rgbToHex(style.bevel_shadow.slice(0,3));
 }
 for(const key of adjustmentKeys) {
   const row=document.createElement('label');row.className='slider';
@@ -239,12 +560,13 @@ for(const key of adjustmentKeys) {
   const output=document.createElement('output');output.id='adjust-'+key+'-value';
   const input=document.createElement('input');Object.assign(input,{id:'adjust-'+key,type:'range',min:-100,max:100,value:0});
   row.append(label,output,input);$('adjustment-sliders').append(row);
-  propertyInput(input.id,e=>{const l=selectedArtLayer();if(l?.content.op==='adjustment'){l.content[key]=Number(e.value)/100;output.textContent=e.value;}});
+  propertyInput(input.id,e=>{const l=selectedArtLayer();if(kindIs(l,'adjustment')){l.content[key]=Number(e.value)/100;output.textContent=e.value;}});
 }
+propertyInput('fill-color',e=>{const l=selectedArtLayer();if(kindIs(l,'fill'))l.content.color=[...hexToRgb(e.value),255];});
 $('layer-add-photo').onclick=()=>$('file-layer-photo').click();
 $('file-layer-photo').onchange=async e=>{
   const file=e.target.files[0],id=activeId;e.target.value='';if(!file||!id)return;
-  if(adjust.get(id).artLayers.length>=128)return say('An image can hold up to 128 layers.',true);
+  if(!roomFor(adjust.get(id)))return;
   if(file.size>LIMITS.maxImageBytes)return say('This photo exceeds the image size limit.',true);
   try {
     const bytes=new Uint8Array(await file.arrayBuffer());if(activeId!==id)return say('Select the intended document and import the photo again.');
@@ -255,13 +577,13 @@ $('file-layer-photo').onchange=async e=>{
   } catch(error){fail(error);}
 };
 $('layer-add-adjustment').onclick=()=>{
-  if(!activeId)return;if(adjust.get(activeId).artLayers.length>=128)return say('An image can hold up to 128 layers.',true);
+  if(!activeId || !roomFor(adjust.get(activeId)))return;
   leaveTools();edit('Add adjustment layer',a=>addArt(a,'Adjustment',{op:'adjustment',...Object.fromEntries(adjustmentKeys.map(k=>[k,0]))}));syncControls();
 };
 $('layer-transform').onclick=()=>activateTool('transform');
 $('transform-reset').onclick=()=>{const l=selectedArtLayer();if(l){edit('Reset transform',()=>delete l.transform);syncControls();}};
 for(const key of ['tx','ty','sx','sy','rotation']) propertyInput('transform-'+key,e=>{
-  const l=selectedArtLayer();if(!l)return;const t=transformFor(l),lo=Number(e.min),hi=Number(e.max);
+  const l=selectedArtLayer();if(!movable(l))return;const t=transformFor(l),lo=Number(e.min),hi=Number(e.max);
   t[key]=clamp(Number(e.value)||0,lo,hi)/(key==='rotation'?1:100);
 });
 $('mask-add').onclick=()=>{
@@ -270,22 +592,31 @@ $('mask-add').onclick=()=>{
 $('mask-remove').onclick=()=>{const l=selectedArtLayer();if(!l)return;leaveTools();edit('Remove layer mask',()=>l.mask=null);syncControls();};
 $('mask-paint').onclick=()=>activateTool('mask');
 for(const k of ['enabled','inverted']) propertyInput('mask-'+k,e=>{const l=selectedArtLayer();if(l?.mask)l.mask[k]=e.checked;});
-for(const k of ['shadow','outline']) {
-  propertyInput('style-'+k,e=>{const l=selectedArtLayer();if(l)(l.style??=defaultStyle())[k]=e.checked;});
-  propertyInput('style-'+k+'-color',e=>{const l=selectedArtLayer();if(l){const s=l.style??=defaultStyle();s[k+'_color']=[...hexToRgb(e.value),s[k+'_color'][3]];}});
-}
-propertyInput('style-shadow-opacity',e=>{const l=selectedArtLayer();if(l)(l.style??=defaultStyle()).shadow_color[3]=Math.round(clamp(Number(e.value),0,100)/100*255);});
-for(const k of ['shadow_blur','shadow_x','shadow_y','outline_width'])propertyInput('style-'+k.replaceAll('_','-'),e=>{
-  const l=selectedArtLayer();if(l)(l.style??=defaultStyle())[k]=clamp(Number(e.value),Number(e.min),Number(e.max))/100;
+for(const k of ['shadow','outline','glow','inner_glow','bevel']) propertyInput('style-'+k,e=>{const l=selectedArtLayer();if(movable(l))styleOf(l)[k]=e.checked;});
+for(const k of ['shadow','outline','glow','inner_glow']) propertyInput('style-'+k+'-color',e=>{const l=selectedArtLayer();if(movable(l)){const s=styleOf(l);s[k+'_color']=[...hexToRgb(e.value),s[k+'_color'][3]];}});
+for(const k of ['shadow','glow','inner_glow']) propertyInput('style-'+k+'-opacity',e=>{const l=selectedArtLayer();if(movable(l))styleOf(l)[k+'_color'][3]=Math.round(clamp(Number(e.value),0,100)/100*255);});
+for(const [k,id] of [['shadow_blur','shadow-blur'],['shadow_x','shadow-x'],['shadow_y','shadow-y'],['outline_width','outline-width'],['glow_size','glow-size'],['inner_glow_size','inner_glow-size'],['bevel_size','bevel-size']])propertyInput('style-'+id,e=>{
+  const l=selectedArtLayer();if(movable(l))styleOf(l)[k]=clamp(Number(e.value),Number(e.min),Number(e.max))/100;
 });
+propertyInput('style-bevel-depth',e=>{const l=selectedArtLayer();if(movable(l))styleOf(l).bevel_depth=clamp(Number(e.value),0,300)/100;});
+propertyInput('style-bevel-angle',e=>{const l=selectedArtLayer();if(movable(l))styleOf(l).bevel_angle=clamp(Number(e.value)||0,-360,360);});
+for(const k of ['highlight','shadow']) propertyInput('style-bevel-'+k,e=>{const l=selectedArtLayer();if(movable(l)){const s=styleOf(l);s['bevel_'+k]=[...hexToRgb(e.value),s['bevel_'+k][3]];}});
 function enterLayerTool(tool) {
-  const l=selectedArtLayer();if(!l)return say('Select a layer from the Layers panel first.');
-  if(tool==='transform'&&l.content.op==='adjustment')return say('Adjustment layers affect the layers below. Use a mask to target an area.');
-  if(tool==='mask'&&!l.mask)return say('Add a mask to this layer first.');
+  const l=selectedArtLayer();
+  if(tool==='mask') {
+    if(!l)return say('Select a layer from the Layers panel first.');
+    if(!l.mask)return say('Add a mask to this layer first.');
+  } else if(l && !movable(l) && !isGroup(l)) return say('Adjustment and retouch layers affect the layers below. Use a mask to target an area.');
   layerTool=tool;$('ink').hidden=false;requestAnimationFrame(drawLayerTool);
 }
 function handleGeometry(l) {
-  const [x,y,w,h]=layerBounds(l),a=adjust.get(activeId);
+  const a=adjust.get(activeId), ink=$('ink');
+  if(isGroup(l)) {
+    const b=outBox(l,a); if(!b)return null;
+    const corners=[[b.x0,b.y0],[b.x1,b.y0],[b.x1,b.y1],[b.x0,b.y1]].map(p=>[p[0]*ink.width,p[1]*ink.height]);
+    return {corners,group:true};
+  }
+  const [x,y,w,h]=layerBounds(l);
   const corners=[[x,y],[x+w,y],[x+w,y+h],[x,y+h]].map(p=>sourceToInk(...layerWorld(...p,l.transform),a));
   const center=corners.reduce((sum,p)=>[sum[0]+p[0]/4,sum[1]+p[1]/4],[0,0]);
   const top=[(corners[0][0]+corners[1][0])/2,(corners[0][1]+corners[1][1])/2];
@@ -293,21 +624,24 @@ function handleGeometry(l) {
   return {corners,center,top,rotate:[top[0]+dx/len*28,top[1]+dy/len*28]};
 }
 function drawLayerTool() {
-  if(!layerTool)return;const l=selectedArtLayer();if(!l){leaveTools();return;}
+  if(!layerTool)return;const l=selectedArtLayer();if(!l && layerTool==='mask'){leaveTools();return;}
   syncInk();const ink=$('ink'),ctx=ink.getContext('2d');ink.style.cursor=layerTool==='mask'?'crosshair':'move';
-  if(layerTool==='transform') {
-    const g=handleGeometry(l);ctx.strokeStyle='#77ceff';ctx.lineWidth=1.5;ctx.fillStyle='#15232d';
-    ctx.beginPath();g.corners.forEach((p,i)=>i?ctx.lineTo(...p):ctx.moveTo(...p));ctx.closePath();ctx.stroke();
+  if(layerTool==='transform' && l) {
+    const g=handleGeometry(l); if(!g)return;
+    ctx.strokeStyle='#77ceff';ctx.lineWidth=1.5;ctx.fillStyle='#15232d';
+    if(g.group)ctx.setLineDash([6,4]);
+    ctx.beginPath();g.corners.forEach((p,i)=>i?ctx.lineTo(...p):ctx.moveTo(...p));ctx.closePath();ctx.stroke();ctx.setLineDash([]);
+    if(g.group)return;
     ctx.beginPath();ctx.moveTo(...g.top);ctx.lineTo(...g.rotate);ctx.stroke();
     for(const p of g.corners){ctx.fillRect(p[0]-5,p[1]-5,10,10);ctx.strokeRect(p[0]-5,p[1]-5,10,10);}
     ctx.beginPath();ctx.arc(...g.rotate,6,0,Math.PI*2);ctx.fill();ctx.stroke();
   } else if(maskStroke) {
     ctx.strokeStyle='rgba(119,206,255,.7)';ctx.lineWidth=2;ctx.beginPath();
-    for(let i=0;i<maskStroke.points.length;i+=2){const p=sourceToInk(...layerWorld(maskStroke.points[i],maskStroke.points[i+1],l.content.op==='adjustment'?null:l.transform),adjust.get(activeId));i?ctx.lineTo(...p):ctx.moveTo(...p);}
+    for(let i=0;i<maskStroke.points.length;i+=2){const p=sourceToInk(...layerWorld(maskStroke.points[i],maskStroke.points[i+1],maskSpace(l)),adjust.get(activeId));i?ctx.lineTo(...p):ctx.moveTo(...p);}
     ctx.stroke();
   }
   if(layerTool==='mask' && maskCursor) {
-    const t=l.content.op==='adjustment'?null:l.transform;
+    const t=maskSpace(l);
     const scale=t?Math.sqrt(t.sx*t.sy):1;
     const radius=clamp(Number($('mask-size').value),.1,100)/100*sourceShortOnScreen()*scale/2;
     ctx.beginPath();ctx.arc(maskCursor[0],maskCursor[1],Math.max(2,radius),0,Math.PI*2);
@@ -315,16 +649,34 @@ function drawLayerTool() {
   }
 }
 function layerPointer(e) {const r=$('ink').getBoundingClientRect();return screenToSource((e.clientX-r.left)/r.width,(e.clientY-r.top)/r.height,adjust.get(activeId));}
+function inkOut(e) {const r=$('ink').getBoundingClientRect();return [(e.clientX-r.left)/r.width,(e.clientY-r.top)/r.height];}
 function maskPoint(e) {
-  const l=selectedArtLayer();const p=layerLocal(...layerPointer(e),l.content.op==='adjustment'?null:l.transform).map(v=>clamp(v,0,1));
+  const l=selectedArtLayer();const p=layerLocal(...layerPointer(e),maskSpace(l)).map(v=>clamp(v,0,1));
   const a=maskStroke.points;
   if(a.length>=20000)return;
   if(a.length && Math.hypot(p[0]-a[a.length-2],p[1]-a[a.length-1])<.002)return;
   a.push(...p);
 }
+/** The guide under the pointer, if any, within a few screen pixels. */
+function guideAt(e) {
+  const a=adjust.get(activeId); if(!view.guides||!a)return null;
+  const r=$('ink').getBoundingClientRect(), [x,y]=inkOut(e);
+  for(const axis of ['x','y']) {
+    const size=axis==='x'?r.width:r.height, at=axis==='x'?x:y;
+    const i=a.guides[axis].findIndex(v=>Math.abs(v-at)*size<5);
+    if(i>=0)return {axis,i};
+  }
+  return null;
+}
 $('ink').addEventListener('pointerdown',e=>{
   if(!layerTool||panning()||e.button!==0)return;
-  const l=selectedArtLayer();if(!l?.visible)return say('Show this layer before editing it.');
+  const l=selectedArtLayer();
+  if(layerTool==='transform') {
+    const g=guideAt(e);
+    if(g) { pushHistory('Move guide'); guideDrag=g; $('ink').setPointerCapture(e.pointerId); e.preventDefault(); return; }
+    if(!l)return;
+  }
+  if(!l?.visible)return say('Show this layer before editing it.');
   if(layerTool==='mask') {
     if(!l.mask?.enabled)return say('Enable this mask before painting.');
     const hide=$('mask-mode').value==='hide',color=hide?0:255;
@@ -332,44 +684,512 @@ $('ink').addEventListener('pointerdown',e=>{
     const value=l.mask.inverted?255-color:color;
     maskStroke={color:[value,value,value,Math.round(clamp(Number($('mask-strength').value),1,100)/100*255)],width:clamp(Number($('mask-size').value),.1,100)/100,erase:false,points:[]};maskPoint(e);
   } else {
-    const r=$('ink').getBoundingClientRect(),p=[e.clientX-r.left,e.clientY-r.top],g=handleGeometry(l);
-    const corner=g.corners.findIndex(q=>Math.hypot(q[0]-p[0],q[1]-p[1])<14);
-    const mode=Math.hypot(g.rotate[0]-p[0],g.rotate[1]-p[1])<14?'rotate':corner>=0?'scale':'move';
-    pushHistory('Transform layer');const t=structuredClone(transformFor(l));
-    layerDrag={mode,t,start:layerPointer(e),local:layerLocal(...layerPointer(e),t)};
+    const a=adjust.get(activeId), r=$('ink').getBoundingClientRect(),p=[e.clientX-r.left,e.clientY-r.top],g=handleGeometry(l);
+    if(!g)return;
+    const corner=g.group?-1:g.corners.findIndex(q=>Math.hypot(q[0]-p[0],q[1]-p[1])<14);
+    const mode=!g.group&&Math.hypot(g.rotate[0]-p[0],g.rotate[1]-p[1])<14?'rotate':corner>=0?'scale':'move';
+    pushHistory('Transform layer');
+    const members=isGroup(l)?allArt({artLayers:l.children}).filter(movable):[l];
+    const bases=new Map(members.map(m=>[m.id,structuredClone(transformFor(m))]));
+    const skip=new Set(isGroup(l)?[l.id,...allArt({artLayers:l.children}).map(m=>m.id)]:[l.id]);
+    const t=isGroup(l)?null:bases.get(l.id);
+    layerDrag={mode,t,bases,start:layerPointer(e),startOut:inkOut(e),local:t&&layerLocal(...layerPointer(e),t),
+      box:mode==='move'&&view.snap?outBox(l,a):null,targets:mode==='move'&&view.snap?snapTargets(a,skip):null};
   }
   $('ink').setPointerCapture(e.pointerId);e.preventDefault();drawLayerTool();
 });
 $('ink').addEventListener('pointermove',e=>{
   if(!layerTool)return;
+  if(guideDrag) { const a=adjust.get(activeId),o=inkOut(e); a.guides[guideDrag.axis][guideDrag.i]=guideDrag.axis==='x'?o[0]:o[1]; drawHud(); return; }
+  if(layerTool==='transform'&&!layerDrag) { $('ink').style.cursor=guideAt(e)?(guideAt(e).axis==='x'?'ew-resize':'ns-resize'):'move'; }
   if(layerTool==='mask'){const r=$('ink').getBoundingClientRect();maskCursor=[e.clientX-r.left,e.clientY-r.top];if(maskStroke)maskPoint(e);drawLayerTool();return;}
   if(!layerDrag)return;
-  const l=selectedArtLayer(),d=layerDrag,p=layerPointer(e),t=l.transform,base=d.t;
-  if(d.mode==='move') {t.tx=clamp(base.tx+p[0]-d.start[0],-2,2);t.ty=clamp(base.ty+p[1]-d.start[1],-2,2);}
-  else if(d.mode==='rotate') {
-    const [w,h]=layerDimensions(),cx=base.anchor_x+base.tx,cy=base.anchor_y+base.ty;
-    const delta=(Math.atan2((p[1]-cy)*h,(p[0]-cx)*w)-Math.atan2((d.start[1]-cy)*h,(d.start[0]-cx)*w))*180/Math.PI;
-    let angle=((base.rotation+delta+540)%360)-180;if(e.shiftKey)angle=Math.round(angle/15)*15;t.rotation=angle;
+  const l=selectedArtLayer(),d=layerDrag,a=adjust.get(activeId);
+  if(d.mode==='move') {
+    const o=inkOut(e), delta=[o[0]-d.startOut[0],o[1]-d.startOut[1]];
+    snapLines=[];
+    if(d.box&&!e.altKey) { const r=$('ink').getBoundingClientRect(); snapLines=snapDelta(d.box,delta,d.targets,6/r.width,6/r.height); }
+    const s=outDeltaToSource(...delta,a);
+    for(const [id,base] of d.bases) { const m=findArt(a,id)?.layer; if(m){m.transform={...m.transform,tx:clamp(base.tx+s[0],-2,2),ty:clamp(base.ty+s[1],-2,2)};} }
+    drawHud();
   } else {
-    const q=layerLocal(...p,base),dx=d.local[0]-base.anchor_x,dy=d.local[1]-base.anchor_y;
-    let sx=Math.abs(dx)>.00001?(q[0]-base.anchor_x)/dx:1,sy=Math.abs(dy)>.00001?(q[1]-base.anchor_y)/dy:1;
-    if($('transform-lock').checked) {const [w,h]=layerDimensions();const ux=dx*w,uy=dy*h;const f=(ux*(q[0]-base.anchor_x)*w+uy*(q[1]-base.anchor_y)*h)/(ux*ux+uy*uy||1);sx=sy=f;}
-    t.sx=clamp(base.sx*sx,.01,10);t.sy=clamp(base.sy*sy,.01,10);
+    const p=layerPointer(e),t=l.transform,base=d.t;
+    if(d.mode==='rotate') {
+      const [w,h]=layerDimensions(),cx=base.anchor_x+base.tx,cy=base.anchor_y+base.ty;
+      const delta=(Math.atan2((p[1]-cy)*h,(p[0]-cx)*w)-Math.atan2((d.start[1]-cy)*h,(d.start[0]-cx)*w))*180/Math.PI;
+      let angle=((base.rotation+delta+540)%360)-180;if(e.shiftKey)angle=Math.round(angle/15)*15;t.rotation=angle;
+    } else {
+      const q=layerLocal(...p,base),dx=d.local[0]-base.anchor_x,dy=d.local[1]-base.anchor_y;
+      let sx=Math.abs(dx)>.00001?(q[0]-base.anchor_x)/dx:1,sy=Math.abs(dy)>.00001?(q[1]-base.anchor_y)/dy:1;
+      if($('transform-lock').checked) {const [w,h]=layerDimensions();const ux=dx*w,uy=dy*h;const f=(ux*(q[0]-base.anchor_x)*w+uy*(q[1]-base.anchor_y)*h)/(ux*ux+uy*uy||1);sx=sy=f;}
+      t.sx=clamp(base.sx*sx,.01,10);t.sy=clamp(base.sy*sy,.01,10);
+    }
   }
   scheduleRender();
 });
 $('ink').addEventListener('pointerleave',()=>{maskCursor=null;if(layerTool==='mask')drawLayerTool();});
-for(const event of ['pointerup','pointercancel'])$('ink').addEventListener(event,()=>{
+for(const event of ['pointerup','pointercancel'])$('ink').addEventListener(event,e=>{
+  if(guideDrag) {
+    const g=guideDrag;guideDrag=null;const a=adjust.get(activeId),v=a.guides[g.axis][g.i];
+    // Dragging a guide off the image removes it, as with Photoshop's rulers.
+    if(event==='pointercancel'||!(v>=0&&v<=1)) a.guides[g.axis].splice(g.i,1);
+    syncControls();scheduleRender();return;
+  }
   if(maskStroke) {
     const stroke=maskStroke;maskStroke=null;const l=selectedArtLayer();
     if(event!=='pointercancel'&&l?.mask) {
-      const candidate=structuredClone(adjust.get(activeId));candidate.artLayers.find(x=>x.id===l.id).mask.strokes.push(stroke);
+      const candidate=structuredClone(adjust.get(activeId));findArt(candidate,l.id).layer.mask.strokes.push(stroke);
       try {ed.set_ops(activeId,JSON.stringify(buildOps(candidate)));edit('Paint layer mask',()=>l.mask.strokes.push(stroke));} catch(error){fail(error);}
     }
     scheduleRender();syncControls();requestAnimationFrame(refreshLayers);
   }
-  if(layerDrag){if(event==='pointercancel'){const l=selectedArtLayer();if(l)l.transform=layerDrag.t;}layerDrag=null;scheduleRender();syncControls();requestAnimationFrame(refreshLayers);}
+  if(layerDrag){
+    if(event==='pointercancel'){const a=adjust.get(activeId);for(const [id,base] of layerDrag.bases){const m=findArt(a,id)?.layer;if(m)m.transform=base;}}
+    layerDrag=null;snapLines=[];drawHud();scheduleRender();syncControls();requestAnimationFrame(refreshLayers);
+  }
 });
+
+// --- snapping & alignment ------------------------------------------------------
+// Everything here works in normalized output coordinates -- what you see --
+// and converts to source space only when it moves a layer.
+let snapLines = [];
+function gridLines(axis) {
+  const canvas=$('canvas'), short=Math.min(canvas.width,canvas.height), size=axis==='x'?canvas.width:canvas.height;
+  const step=view.gridSize/100*short/size, out=[];
+  if(step>0) for(let v=0;v<=1.0001&&out.length<400;v+=step) out.push(v);
+  return out;
+}
+function snapTargets(a, skip) {
+  const xs=[0,.5,1], ys=[0,.5,1];
+  if(view.guides) { xs.push(...a.guides.x); ys.push(...a.guides.y); }
+  if(view.grid) { xs.push(...gridLines('x')); ys.push(...gridLines('y')); }
+  for(const l of allArt(a)) {
+    if(skip.has(l.id)||!l.visible||!movable(l))continue;
+    const b=outBox(l,a); if(!b)continue;
+    xs.push(b.x0,(b.x0+b.x1)/2,b.x1); ys.push(b.y0,(b.y0+b.y1)/2,b.y1);
+  }
+  return {xs,ys};
+}
+/** Nudges `delta` so an edge or center of `box` lands on the nearest target
+ *  within tolerance on each axis. Returns the lines it snapped to. */
+function snapDelta(box, delta, targets, tolX, tolY) {
+  const lines=[];
+  for(const [axis,i,tol,edges,list] of [['x',0,tolX,[box.x0,(box.x0+box.x1)/2,box.x1],targets.xs],['y',1,tolY,[box.y0,(box.y0+box.y1)/2,box.y1],targets.ys]]) {
+    let best=null;
+    for(const v of edges) for(const t of list) { const diff=t-(v+delta[i]); if(Math.abs(diff)<=tol&&(!best||Math.abs(diff)<Math.abs(best.diff)))best={diff,t}; }
+    if(best){delta[i]+=best.diff;lines.push({axis,pos:best.t});}
+  }
+  return lines;
+}
+function alignTargets() {
+  const a=adjust.get(activeId); if(!a)return null;
+  const items=topLevelSelection(a).map(id=>findArt(a,id).layer).map(l=>({l,box:outBox(l,a)})).filter(i=>i.box);
+  if(!items.length){say('Select a layer, text, shape or group to arrange.');return null;}
+  return {a,items};
+}
+function alignSelected(how) {
+  const t=alignTargets(); if(!t)return;
+  const ref=$('align-to').value==='layers'&&t.items.length>1?unionBox(t.items.map(i=>i.box)):{x0:0,y0:0,x1:1,y1:1};
+  edit('Align layers',s=>{ for(const {l,box:b} of t.items) {
+    const dx={left:ref.x0-b.x0,hcenter:(ref.x0+ref.x1-b.x0-b.x1)/2,right:ref.x1-b.x1}[how]??0;
+    const dy={top:ref.y0-b.y0,vcenter:(ref.y0+ref.y1-b.y0-b.y1)/2,bottom:ref.y1-b.y1}[how]??0;
+    translateArt(findArt(s,l.id).layer,outDeltaToSource(dx,dy,s));
+  }});
+  syncControls();
+}
+function distributeSelected(axis) {
+  const t=alignTargets(); if(!t)return;
+  if(t.items.length<3)return say('Select three or more layers to distribute them.');
+  const c=(b)=>axis==='x'?(b.x0+b.x1)/2:(b.y0+b.y1)/2;
+  const items=[...t.items].sort((p,q)=>c(p.box)-c(q.box)), first=c(items[0].box), last=c(items.at(-1).box);
+  edit('Distribute layers',s=>items.forEach(({l,box},i)=>{
+    const shift=first+(last-first)*i/(items.length-1)-c(box);
+    translateArt(findArt(s,l.id).layer,outDeltaToSource(axis==='x'?shift:0,axis==='y'?shift:0,s));
+  }));
+  syncControls();
+}
+document.querySelectorAll('[data-align]').forEach(b=>b.onclick=()=>alignSelected(b.dataset.align));
+$('distribute-h').onclick=()=>distributeSelected('x');
+$('distribute-v').onclick=()=>distributeSelected('y');
+
+// --- guides & grid -----------------------------------------------------------
+const view = { guides: true, snap: true, grid: false, gridSize: 10 };
+function addGuide(axis) {
+  const a=adjust.get(activeId); if(!a)return say('Import an image first.');
+  if(a.guides.x.length+a.guides.y.length>=(LIMITS?.maxGuides??64))return say('An image can hold up to 64 guides.',true);
+  edit(axis==='x'?'Add vertical guide':'Add horizontal guide',s=>s.guides[axis].push(.5));
+  view.guides=true; syncControls();
+}
+$('guide-add-v').onclick=()=>addGuide('x');
+$('guide-add-h').onclick=()=>addGuide('y');
+$('guide-clear').onclick=()=>{ const a=adjust.get(activeId); if(a&&(a.guides.x.length||a.guides.y.length)){edit('Clear guides',s=>s.guides={x:[],y:[]});syncControls();} };
+function renderGuides() {
+  const a=adjust.get(activeId), list=$('guide-list'); list.replaceChildren(); if(!a)return;
+  for(const axis of ['x','y']) a.guides[axis].forEach((v,i)=>{
+    const li=document.createElement('li'), label=document.createElement('span'), input=document.createElement('input'), drop=document.createElement('button');
+    label.textContent=axis==='x'?'Vertical %':'Horizontal %';
+    Object.assign(input,{type:'number',min:0,max:100,step:0.1,value:+(v*100).toFixed(2)});
+    input.setAttribute('aria-label',`${label.textContent} guide position`);
+    input.onchange=()=>{edit('Move guide',s=>s.guides[axis][i]=clamp(Number(input.value)||0,0,100)/100);syncControls();};
+    drop.className='btn sm ghost';drop.textContent='×';drop.setAttribute('aria-label','Remove guide');
+    drop.onclick=()=>{edit('Remove guide',s=>s.guides[axis].splice(i,1));syncControls();};
+    li.append(label,input,drop);list.append(li);
+  });
+  $('view-guides').checked=view.guides;$('view-snap').checked=view.snap;$('view-grid').checked=view.grid;
+}
+$('view-guides').onchange=e=>{view.guides=e.target.checked;drawHud();};
+$('view-snap').onchange=e=>{view.snap=e.target.checked;};
+$('view-grid').onchange=e=>{view.grid=e.target.checked;drawHud();};
+$('grid-size').onchange=e=>{view.gridSize=clamp(Number(e.target.value)||10,1,50);e.target.value=view.gridSize;drawHud();};
+
+// --- HUD: guides, grid, selection outline, snap lines and text boxes ----------
+// One overlay canvas that never takes the pointer. It is capped in area and
+// stretched to the image, so deep zoom cannot ask for a gigapixel canvas.
+const HUD_MAX_AREA = 16e6;
+let antsPhase = 0, antsTimer = null, selCache = { key: null };
+function syncHud() {
+  const hud=$('hud'), canvas=$('canvas');
+  if(canvas.hidden||!activeId||$('image-workspace').hidden){hud.hidden=true;return null;}
+  hud.hidden=false;
+  const r=canvas.getBoundingClientRect(), parent=hud.parentElement.getBoundingClientRect();
+  const scale=Math.min(1,Math.sqrt(HUD_MAX_AREA/Math.max(1,r.width*r.height)));
+  const w=Math.max(1,Math.round(r.width*scale)), h=Math.max(1,Math.round(r.height*scale));
+  if(hud.width!==w||hud.height!==h){hud.width=w;hud.height=h;}
+  Object.assign(hud.style,{left:`${r.left-parent.left}px`,top:`${r.top-parent.top}px`,width:`${r.width}px`,height:`${r.height}px`});
+  return {w,h,ctx:hud.getContext('2d')};
+}
+function selectionEdges(a) {
+  const canvas=$('canvas');
+  // A lasso outline can hold hundreds of thousands of numbers, so it is keyed
+  // by a checksum rather than serialized on every frame of the ants.
+  const sum=(p)=>p.reduce((t,v,i)=>t+v*((i%7)+1),p.length);
+  const sig=a.selection&&{...a.selection,shapes:a.selection.shapes.map(sh=>sh.points?{...sh,points:sum(sh.points)}:sh)};
+  const key=JSON.stringify([sig,a.crop,a.lasso?sum(a.lasso):0,a.turns,a.flipH,a.flipV,canvas.width,canvas.height,activeId]);
+  if(selCache.key===key)return selCache;
+  selCache={key,edges:null};
+  if(!a.selection?.shapes.length)return selCache;
+  let mask;
+  try { ed.set_ops(activeId,JSON.stringify(buildOps(a))); mask=ed.selection_preview(activeId,JSON.stringify(a.selection),previewCap()); } catch(e){ fail(e); return selCache; }
+  const w=canvas.width,h=canvas.height; if(mask.length!==w*h)return selCache;
+  const edges=[]; let any=false;
+  for(let y=0;y<h;y++) for(let x=0;x<w;x++) {
+    const i=y*w+x; if(mask[i]<128)continue; any=true;
+    if(x===0||y===0||x===w-1||y===h-1||mask[i-1]<128||mask[i+1]<128||mask[i-w]<128||mask[i+w]<128) edges.push(i);
+  }
+  selCache={key,w,h,any,edges:Int32Array.from(edges)};
+  return selCache;
+}
+/** Visible guides as screen lines, plus the text frame and its handle. */
+function textFrame(l, a) {
+  if(!kindIs(l,'text')||!(l.content.box_width>0))return null;
+  const t=l.content, b=layerBounds(l), y1=Math.max(t.y+.02,b[1]+b[3]);
+  const local=[[t.x,t.y],[t.x+t.box_width,t.y],[t.x+t.box_width,y1],[t.x,y1]];
+  const poly=local.map(p=>sourceToOut(...layerWorld(...p,l.transform),a));
+  return {poly,handle:sourceToOut(...layerWorld(t.x+t.box_width,(t.y+y1)/2,l.transform),a)};
+}
+function drawHud() {
+  const s=syncHud(); if(!s)return;
+  const {w,h,ctx}=s; ctx.clearRect(0,0,w,h);
+  const a=adjust.get(activeId); if(!a||comparing)return;
+  const line=(axis,v)=>{ctx.beginPath();if(axis==='x'){const x=Math.round(v*w)+.5;ctx.moveTo(x,0);ctx.lineTo(x,h);}else{const y=Math.round(v*h)+.5;ctx.moveTo(0,y);ctx.lineTo(w,y);}ctx.stroke();};
+  if(view.grid){ctx.strokeStyle='rgba(255,255,255,.18)';ctx.lineWidth=1;for(const axis of ['x','y'])gridLines(axis).forEach(v=>line(axis,v));}
+  if(view.guides){ctx.strokeStyle='#33d1ff';ctx.lineWidth=1;for(const axis of ['x','y'])a.guides[axis].forEach(v=>line(axis,v));}
+  const sel=selectionEdges(a);
+  if(sel.edges?.length){
+    const sx=w/sel.w, sy=h/sel.h, size=Math.max(1,Math.ceil(Math.max(sx,sy)));
+    const dark=new Path2D(), light=new Path2D();
+    for(const i of sel.edges){const x=i%sel.w,y=(i/sel.w)|0;(((x+y+antsPhase)>>2)&1?dark:light).rect(Math.floor(x*sx),Math.floor(y*sy),size,size);}
+    ctx.fillStyle='#000';ctx.fill(dark);ctx.fillStyle='#fff';ctx.fill(light);
+  }
+  if(snapLines.length){ctx.strokeStyle='#ff4fd8';ctx.lineWidth=1;for(const l of snapLines)line(l.axis,l.pos);}
+  if(textTool){
+    const f=textFrame(selectedArtLayer(),a);
+    if(f){
+      ctx.strokeStyle='#77ceff';ctx.setLineDash([5,4]);ctx.lineWidth=1;ctx.beginPath();
+      f.poly.forEach((p,i)=>i?ctx.lineTo(p[0]*w,p[1]*h):ctx.moveTo(p[0]*w,p[1]*h));ctx.closePath();ctx.stroke();ctx.setLineDash([]);
+      ctx.fillStyle='#15232d';ctx.lineWidth=1.5;ctx.fillRect(f.handle[0]*w-5,f.handle[1]*h-5,10,10);ctx.strokeRect(f.handle[0]*w-5,f.handle[1]*h-5,10,10);
+    }
+  }
+}
+function updateAnts() {
+  const a=adjust.get(activeId), want=!!a?.selection?.shapes.length && !$('image-workspace').hidden;
+  if(want&&!antsTimer) antsTimer=setInterval(()=>{antsPhase=(antsPhase+1)%8;drawHud();},160);
+  if(!want&&antsTimer){clearInterval(antsTimer);antsTimer=null;}
+}
+
+// --- selections ----------------------------------------------------------------
+// A selection is a list of shapes in source coordinates plus refinements. It
+// lives in the document state, so it is part of undo, but it is not an edit:
+// it only does something when turned into a mask, a fill, a copy or a crop.
+let selectTool = false, selectKind = "rect", selectDrag = null;
+const emptySelection = () => ({ shapes: [], feather: 0, shift: 0, smooth: 0, refine: 0, invert: false });
+function enterSelect() {
+  if (!activeId) return;
+  selectTool = true;
+  $("select-bar").hidden = false; $("ink").hidden = false; $("ink").style.cursor = "crosshair";
+  syncSelectBar(); requestAnimationFrame(syncInk);
+}
+function exitSelect() {
+  if (!selectTool) return;
+  selectTool = false; selectDrag = null;
+  $("select-bar").hidden = true;
+  const ink = $("ink"); ink.hidden = true; ink.getContext("2d").clearRect(0, 0, ink.width, ink.height);
+  updateToolUI();
+}
+function syncSelectBar() {
+  for (const b of document.querySelectorAll("#select-kind .btn")) b.setAttribute("aria-pressed", String(b.dataset.kind === selectKind));
+  $("wand-options").hidden = selectKind !== "wand";
+}
+document.querySelectorAll("#select-kind .btn").forEach((b) => (b.onclick = () => { selectKind = b.dataset.kind; syncSelectBar(); }));
+$("btn-select-done").onclick = exitSelect;
+function commitSelection(shape, mode) {
+  const a = adjust.get(activeId); if (!a) return;
+  if (mode !== "new" && (a.selection?.shapes.length ?? 0) >= 64) return say("A selection can combine up to 64 shapes. Refine or deselect first.", true);
+  const labels = { new: "Select", add: "Add to selection", subtract: "Subtract from selection", intersect: "Intersect selection" };
+  edit(labels[mode], (s) => {
+    if (mode === "new" || !s.selection) s.selection = emptySelection();
+    s.selection.shapes.push({ ...shape, mode: mode === "new" ? "add" : mode });
+  });
+  syncControls();
+}
+const setSelection = (label, fn) => { if (!activeId) return; edit(label, fn); syncControls(); };
+const selectAll = () => setSelection("Select all", (s) => (s.selection = { ...emptySelection(), shapes: [{ kind: "all", mode: "add" }] }));
+const deselect = () => { if (adjust.get(activeId)?.selection) setSelection("Deselect", (s) => (s.selection = null)); };
+const invertSelection = () => setSelection("Invert selection", (s) => {
+  if (!s.selection) s.selection = { ...emptySelection(), shapes: [{ kind: "all", mode: "add" }] };
+  s.selection.invert = !s.selection.invert;
+});
+$("select-all").onclick = selectAll;
+$("select-none").onclick = deselect;
+$("select-inverse").onclick = invertSelection;
+$("sel-clear").onclick = deselect;
+function inkPx(e) { const ink = $("ink"), r = ink.getBoundingClientRect(); return [(e.clientX - r.left) * ink.width / r.width, (e.clientY - r.top) * ink.height / r.height]; }
+(() => {
+  const ink = $("ink");
+  ink.addEventListener("pointerdown", (e) => {
+    if (!selectTool || !activeId || e.button !== 0 || panning()) return;
+    const a = adjust.get(activeId);
+    // Photoshop's modifiers: Shift adds, Alt subtracts, both intersect.
+    const mode = e.shiftKey && e.altKey ? "intersect" : e.shiftKey ? "add" : e.altKey ? "subtract" : $("select-mode").value;
+    const at = screenToSource(...inkOut(e), a).map((v) => clamp(v, 0, 1));
+    e.preventDefault();
+    if (selectKind === "wand") {
+      commitSelection({ kind: "wand", x: at[0], y: at[1], tolerance: Number($("wand-tolerance").value) / 100, contiguous: $("wand-contiguous").checked }, mode);
+      return;
+    }
+    ink.setPointerCapture(e.pointerId);
+    selectDrag = { mode, a: inkPx(e), b: inkPx(e), start: at, end: at, points: [...at] };
+  });
+  ink.addEventListener("pointermove", (e) => {
+    if (!selectTool || !selectDrag) return;
+    const d = selectDrag, p = inkPx(e);
+    d.b = e.shiftKey && selectKind !== "lasso" && d.mode === $("select-mode").value ? constrain(d.a, p, true) : p;
+    d.end = screenToSource(d.b[0] / ink.width, d.b[1] / ink.height, adjust.get(activeId));
+    if (selectKind === "lasso") {
+      const q = screenToSource(...inkOut(e), adjust.get(activeId)).map((v) => clamp(v, 0, 1));
+      const n = d.points.length;
+      if (n < 400000 && Math.hypot(q[0] - d.points[n - 2], q[1] - d.points[n - 1]) > 0.002) d.points.push(...q);
+    }
+    const ctx = ink.getContext("2d");
+    ctx.clearRect(0, 0, ink.width, ink.height);
+    const path = new Path2D();
+    if (selectKind === "rect") path.rect(Math.min(d.a[0], d.b[0]), Math.min(d.a[1], d.b[1]), Math.abs(d.b[0] - d.a[0]), Math.abs(d.b[1] - d.a[1]));
+    else if (selectKind === "ellipse") path.ellipse((d.a[0] + d.b[0]) / 2, (d.a[1] + d.b[1]) / 2, Math.abs(d.b[0] - d.a[0]) / 2, Math.abs(d.b[1] - d.a[1]) / 2, 0, 0, Math.PI * 2);
+    else { for (let i = 0; i < d.points.length; i += 2) { const q = sourceToInk(d.points[i], d.points[i + 1], adjust.get(activeId)); i ? path.lineTo(...q) : path.moveTo(...q); } path.closePath(); }
+    ctx.lineWidth = 1; ctx.strokeStyle = "#000"; ctx.stroke(path);
+    ctx.setLineDash([4, 4]); ctx.strokeStyle = "#fff"; ctx.stroke(path); ctx.setLineDash([]);
+  });
+  for (const t of ["pointerup", "pointercancel"]) {
+    ink.addEventListener(t, () => {
+      if (!selectTool || !selectDrag) return;
+      const d = selectDrag; selectDrag = null;
+      ink.getContext("2d").clearRect(0, 0, ink.width, ink.height);
+      if (t === "pointercancel") return;
+      const moved = Math.hypot(d.b[0] - d.a[0], d.b[1] - d.a[1]);
+      if (selectKind === "lasso") {
+        if (d.points.length >= 6) commitSelection({ kind: "polygon", points: d.points }, d.mode);
+        else if (d.mode === "new") deselect();
+        return;
+      }
+      // A click without a drag clears the selection, as in Photoshop.
+      if (moved < 3) { if (d.mode === "new") deselect(); return; }
+      commitSelection({ kind: selectKind, x0: d.start[0], y0: d.start[1], x1: clamp(d.end[0], -1, 2), y1: clamp(d.end[1], -1, 2) }, d.mode);
+    });
+  }
+})();
+function renderSelectionPanel() {
+  const sel = adjust.get(activeId)?.selection;
+  $("selection-panel").hidden = !sel;
+  if (!sel) return;
+  for (const k of ["feather", "shift", "smooth", "refine"]) if (document.activeElement !== $("sel-" + k)) $("sel-" + k).value = +(sel[k] * 100).toFixed(2);
+  $("sel-invert").checked = sel.invert;
+  const l = selectedArtLayer();
+  $("sel-mask").disabled = !l;
+  $("sel-mask").title = l ? `Make the selection ${l.name}'s mask` : "Select a layer to mask";
+}
+let selGesture = null;
+for (const k of ["feather", "shift", "smooth", "refine"]) {
+  const input = $("sel-" + k);
+  input.addEventListener("input", () => {
+    const a = adjust.get(activeId); if (!a?.selection) return;
+    if (selGesture !== k) { pushHistory("Refine selection"); selGesture = k; }
+    a.selection[k] = clamp(Number(input.value) || 0, Number(input.min), Number(input.max)) / 100;
+    drawHud();
+  });
+  input.addEventListener("change", () => { selGesture = null; drawHud(); });
+}
+$("sel-invert").onchange = invertSelection;
+/** A layer mask that starts from the current selection. Masks live in layer
+ *  space, so the layer's present transform pins the selection in place. */
+function selectionMask(a, l) {
+  return { enabled: true, inverted: false, strokes: [], selection: structuredClone(a.selection), origin: maskSpace(l) ? structuredClone(l.transform || identityTransform()) : identityTransform() };
+}
+function needSelection() { const a = adjust.get(activeId); if (!a?.selection) { say("Make a selection first (W)."); return null; } return a; }
+$("sel-mask").onclick = () => {
+  const a = needSelection(), l = selectedArtLayer(); if (!a) return;
+  if (!l) return say("Select a layer to mask in the Layers panel.");
+  // Painted strokes stay on top of the new selection base.
+  edit("Mask from selection", (s) => { const t = findArt(s, l.id).layer; t.mask = { ...selectionMask(s, t), strokes: t.mask?.strokes || [] }; });
+  syncControls();
+};
+function layerFromSelection(label, name, content) {
+  const a = needSelection(); if (!a || !roomFor(a)) return;
+  edit(label, (s) => { const l = addArt(s, name, content); l.mask = selectionMask(s, l); });
+  syncControls();
+}
+$("sel-copy").onclick = () => layerFromSelection("Copy selection to layer", "Selection copy", { op: "source" });
+$("sel-adjust").onclick = () => layerFromSelection("Add adjustment layer", "Adjustment", { op: "adjustment", ...Object.fromEntries(adjustmentKeys.map((k) => [k, 0])) });
+$("sel-fill").onclick = () => layerFromSelection("Fill selection", "Fill", { op: "fill", color: [...hexToRgb($("sel-fill-color").value), 255] });
+$("sel-crop").onclick = () => {
+  const a = needSelection(); if (!a) return;
+  let b;
+  try { ed.set_ops(activeId, JSON.stringify(buildOps(a))); b = JSON.parse(ed.selection_bounds(activeId, JSON.stringify(a.selection), previewCap())); } catch (e) { return fail(e); }
+  if (!b) return say("Nothing is selected.");
+  edit("Crop to selection", (s) => (s.crop = { x: b[0], y: b[1], w: b[2], h: b[3] }));
+  syncControls(); requestAnimationFrame(refreshLayers);
+};
+
+// --- retouching ------------------------------------------------------------------
+// Clone, heal and dodge/burn paint onto a retouch layer that samples the layers
+// beneath it, so the photograph itself is never altered.
+let retouchTool = null, retouchSource = null, retouchOffset = null, retouchStroke = null, retouchCursor = null;
+const retouchWidth = () => (Number($("retouch-size").value) / 100) * 0.18 + 0.002;
+const RETOUCH_HINTS = {
+  clone: "Alt/Option-click to set the source, then paint",
+  heal: "Paint over a blemish · Alt/Option-click to pick a source",
+  dodge: "Paint to lighten or darken",
+};
+function enterRetouch(kind) {
+  if (!activeId) return;
+  retouchTool = kind;
+  $("retouch-bar").hidden = false; $("ink").hidden = false; $("ink").style.cursor = "crosshair";
+  $("retouch-mode").hidden = $("retouch-range").hidden = kind !== "dodge";
+  $("retouch-strength-label").textContent = kind === "dodge" ? "Exposure" : "Opacity";
+  if (kind === "dodge" && Number($("retouch-strength").value) === 100) $("retouch-strength").value = 50;
+  $("retouch-hint").textContent = RETOUCH_HINTS[kind];
+  requestAnimationFrame(syncInk);
+}
+function exitRetouch() {
+  if (!retouchTool) return;
+  retouchTool = null; retouchStroke = null; retouchCursor = null;
+  $("retouch-bar").hidden = true;
+  const ink = $("ink"); ink.hidden = true; ink.getContext("2d").clearRect(0, 0, ink.width, ink.height);
+  updateToolUI();
+}
+$("btn-retouch-done").onclick = exitRetouch;
+function drawRetouch() {
+  const ink = $("ink"), ctx = ink.getContext("2d"), a = adjust.get(activeId);
+  ctx.clearRect(0, 0, ink.width, ink.height);
+  if (!retouchTool || !a) return;
+  const radius = Math.max(2, retouchWidth() * sourceShortOnScreen() / 2);
+  if (retouchStroke?.points.length) {
+    ctx.save(); ctx.lineCap = ctx.lineJoin = "round"; ctx.lineWidth = radius * 2;
+    ctx.strokeStyle = retouchStroke.kind === "burn" ? "rgba(0,0,0,.25)" : "rgba(255,255,255,.25)";
+    ctx.beginPath();
+    for (let i = 0; i < retouchStroke.points.length; i += 2) { const p = sourceToInk(retouchStroke.points[i], retouchStroke.points[i + 1], a); i ? ctx.lineTo(...p) : ctx.moveTo(...p); }
+    if (retouchStroke.points.length === 2) ctx.lineTo(...sourceToInk(retouchStroke.points[0] + 1e-4, retouchStroke.points[1], a));
+    ctx.stroke(); ctx.restore();
+  }
+  if (!retouchCursor) return;
+  const ring = (x, y, r) => { ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.strokeStyle = "#fff"; ctx.lineWidth = 1.5; ctx.stroke(); ctx.strokeStyle = "#111"; ctx.lineWidth = .5; ctx.stroke(); };
+  ring(...retouchCursor, radius);
+  // Where the brush is sampling from right now.
+  if (retouchTool !== "dodge" && retouchSource) {
+    const here = screenToSource(retouchCursor[0] / ink.width, retouchCursor[1] / ink.height, a);
+    const off = retouchOffset;
+    const [sx, sy] = off ? sourceToInk(here[0] - off[0], here[1] - off[1], a) : sourceToInk(retouchSource[0], retouchSource[1], a);
+    ctx.strokeStyle = "#fff"; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(sx - 8, sy); ctx.lineTo(sx + 8, sy); ctx.moveTo(sx, sy - 8); ctx.lineTo(sx, sy + 8); ctx.stroke();
+    ring(sx, sy, radius);
+  }
+}
+(() => {
+  const ink = $("ink");
+  let last = null;
+  ink.addEventListener("pointerdown", (e) => {
+    if (!retouchTool || !activeId || e.button !== 0 || panning()) return;
+    const a = adjust.get(activeId), at = screenToSource(...inkOut(e), a);
+    e.preventDefault();
+    if (e.altKey && retouchTool !== "dodge") {
+      retouchSource = at.map((v) => clamp(v, 0, 1)); retouchOffset = null;
+      say(retouchTool === "clone" ? "Clone source set. Paint to copy from it." : "Healing source set. Paint to heal from it.");
+      drawRetouch(); return;
+    }
+    if (retouchTool === "clone" && !retouchSource) return say("Alt-click (Option-click on a Mac) where to copy from first.");
+    const target = selectedArtLayer();
+    if (!(kindIs(target, "retouch") && target.visible) && !roomFor(a)) return;
+    // Aligned sampling: the first stroke after picking a source fixes the
+    // offset, and later strokes keep it, as Photoshop's Aligned option does.
+    if (retouchTool !== "dodge" && retouchSource && !retouchOffset) retouchOffset = [at[0] - retouchSource[0], at[1] - retouchSource[1]];
+    const kind = retouchTool === "dodge" ? $("retouch-mode").value : retouchTool;
+    const off = retouchTool !== "dodge" && retouchOffset ? retouchOffset : [0, 0];
+    retouchStroke = {
+      kind, width: retouchWidth(), hardness: Number($("retouch-hardness").value) / 100,
+      strength: Number($("retouch-strength").value) / 100, range: $("retouch-range").value,
+      dx: clamp(off[0], -2, 2), dy: clamp(off[1], -2, 2), points: at.map((v) => clamp(v, 0, 1)),
+    };
+    last = [e.clientX, e.clientY];
+    ink.setPointerCapture(e.pointerId);
+    drawRetouch();
+  });
+  ink.addEventListener("pointermove", (e) => {
+    if (!retouchTool) return;
+    retouchCursor = inkPx(e);
+    if (retouchStroke && Math.hypot(e.clientX - last[0], e.clientY - last[1]) >= 2 && retouchStroke.points.length < 20000) {
+      last = [e.clientX, e.clientY];
+      retouchStroke.points.push(...screenToSource(...inkOut(e), adjust.get(activeId)).map((v) => clamp(v, 0, 1)));
+    }
+    drawRetouch();
+  });
+  ink.addEventListener("pointerleave", () => { if (retouchTool && !retouchStroke) { retouchCursor = null; drawRetouch(); } });
+  for (const t of ["pointerup", "pointercancel"]) {
+    ink.addEventListener(t, () => {
+      if (!retouchTool || !retouchStroke) return;
+      const stroke = retouchStroke; retouchStroke = null;
+      if (t === "pointercancel") return drawRetouch();
+      const a = adjust.get(activeId);
+      try {
+        // Spot healing: with no source picked, the engine finds a clean patch nearby.
+        if (stroke.kind === "heal" && !retouchSource) {
+          ed.set_ops(activeId, JSON.stringify(buildOps(a)));
+          [stroke.dx, stroke.dy] = JSON.parse(ed.heal_offset(activeId, new Float32Array(stroke.points), stroke.width, previewCap())).map((v) => clamp(v, -2, 2));
+        }
+        const commit = (s) => {
+          let target = findArt(s, selectedArt)?.layer;
+          if (!(kindIs(target, "retouch") && target.visible)) target = addArt(s, "Retouch", { op: "retouch", strokes: [] });
+          target.content.strokes.push(structuredClone(stroke));
+        };
+        const candidate = structuredClone(a), keep = [selectedArt, new Set(selectedSet)];
+        commit(candidate);
+        [selectedArt, selectedSet] = keep;
+        ed.set_ops(activeId, JSON.stringify(buildOps(candidate)));
+        const labels = { clone: "Clone stamp", heal: "Healing brush", dodge: "Dodge", burn: "Burn" };
+        edit(labels[stroke.kind], commit);
+      } catch (error) { fail(error); }
+      drawRetouch(); syncControls();
+    });
+  }
+})();
 
 // --- ops translation -------------------------------------------------------
 // Canonical order is geometry, then tone, then colour, then effects, then
@@ -381,6 +1201,9 @@ const hexToRgb = (hex) => { const n = parseInt(hex.slice(1), 16); return [(n >> 
 
 function buildOps(a, { skipGeometry = false } = {}) {
   const ops = [];
+  // Guides are layout metadata the engine ignores; they ride along so they
+  // are saved with the project.
+  if (a.guides.x.length || a.guides.y.length) ops.push({ op: "guides", x: a.guides.x, y: a.guides.y });
   if (!skipGeometry) {
     if (a.crop) ops.push({ op: "crop", ...a.crop });
     if (a.lasso) ops.push({ op: "lasso", points: a.lasso });
@@ -437,7 +1260,8 @@ function parseOps(ops) {
   const pct = (v) => Math.round(v * 100);
   for (const o of ops) {
     switch (o.op) {
-      case "layer": a.artLayers.push(o); break;
+      case "layer": case "group": a.artLayers.push(o); break;
+      case "guides": a.guides = { x: o.x || [], y: o.y || [] }; break;
       case "base_opacity": a.baseOpacity = o.value; break;
       case "exposure": case "warmth": case "sharpen": case "vibrance": a[o.op] = pct(o.value); break;
       case "crop": a.crop = { x: o.x, y: o.y, w: o.w, h: o.h }; break;
@@ -617,6 +1441,12 @@ function draw() {
   if (painting || drawTool) requestAnimationFrame(syncInk);
   if (layerTool) requestAnimationFrame(drawLayerTool);
   if (lassoing) requestAnimationFrame(() => { syncInk(); drawLasso(); });
+  if (selectTool || retouchTool) requestAnimationFrame(() => { syncInk(); if (retouchTool) drawRetouch(); });
+  requestAnimationFrame(drawHud);
+  updateAnts();
+  // Text in a bundled family that is not loaded yet renders as Lato for a
+  // frame, then again once the font arrives.
+  if (!comparing) loadFontsThenRender();
 }
 
 function previewCap() {
@@ -775,7 +1605,11 @@ function syncControls() {
   $("btn-clear-gradients").hidden = !artCount(a, "gradient");
   $("btn-clear-shapes").hidden = !artCount(a, "shapes");
   $("btn-unlasso").hidden = !a.lasso;
+  renderSelectionPanel();
+  renderGuides();
+  updateAnts();
   drawCurves();
+  requestAnimationFrame(drawHud);
 }
 
 function edit(label, fn) {
@@ -1226,6 +2060,13 @@ function exitLasso() {
 
 /** Source coordinates back to a position on the overlay, for drawing. */
 function sourceToInk(sx, sy, a) {
+  const [x, y] = sourceToOut(sx, sy, a), ink = $("ink");
+  return [x * ink.width, y * ink.height];
+}
+
+/** Source coordinates to normalized output (what is on screen), the forward
+ *  direction of screenToSource(). */
+function sourceToOut(sx, sy, a) {
   let x = sx, y = sy;
   if (a.crop) { x = (x - a.crop.x) / a.crop.w; y = (y - a.crop.y) / a.crop.h; }
   if (a.lasso) {
@@ -1238,8 +2079,7 @@ function sourceToInk(sx, sy, a) {
   else if (t === 3) { const u = x; x = y; y = 1 - u; }
   if (a.flipH) x = 1 - x;
   if (a.flipV) y = 1 - y;
-  const ink = $("ink");
-  return [x * ink.width, y * ink.height];
+  return [x, y];
 }
 
 function drawLasso() {
@@ -1572,7 +2412,7 @@ function exitPaint() {
 $("btn-paint").addEventListener("click", () => (painting ? exitPaint() : activateTool("paint")));
 $("btn-paint-done").addEventListener("click", exitPaint);
 $("btn-clear-ink").addEventListener("click", () => {
-  edit("Clear drawing", (a) => (a.artLayers = a.artLayers.filter(l => l.content.op !== "paint")));
+  edit("Clear drawing", (a) => (a.artLayers = pruneArt(a.artLayers, l => kindIs(l, "paint"))));
   syncControls();
 });
 
@@ -1627,9 +2467,9 @@ $("hex").addEventListener("change", (e) => {
     if (artCount(adjust.get(activeId), "paint") >= (LIMITS?.maxStrokes ?? Infinity)) {
       return say(`This image has reached the limit of ${LIMITS.maxStrokes} brush strokes.`, true);
     }
-    const picked = selectedArtLayer();
-    if (brush.erase && (!picked || picked.content.op !== "paint" || !picked.visible)) return say("Select a visible drawing layer to erase.");
-    if ((!picked || picked.content.op !== "paint" || !picked.visible) && adjust.get(activeId).artLayers.length >= 128) return say("An image can hold up to 128 layers.", true);
+    const picked = selectedArtLayer(), onDrawing = kindIs(picked, "paint") && picked.visible;
+    if (brush.erase && !onDrawing) return say("Select a visible drawing layer to erase.");
+    if (!onDrawing && !roomFor(adjust.get(activeId))) return;
     ink.setPointerCapture(e.pointerId);
     const [rgb, a] = [brushRgb(), adjust.get(activeId)];
     inkStroke = {
@@ -1665,10 +2505,7 @@ $("hex").addEventListener("change", (e) => {
       // One history entry per stroke, so Ctrl+Z lifts the last line.
       pushHistory(stroke.erase ? "Eraser" : "Brush stroke");
       let target = selectedArtLayer();
-      if (!target || target.content.op !== "paint" || !target.visible) {
-        target = makeArt("Drawing", { op: "paint", strokes: [] });
-        adjust.get(activeId).artLayers.push(target); selectedArt = target.id;
-      }
+      if (!kindIs(target, "paint") || !target.visible) target = addArt(adjust.get(activeId), "Drawing", { op: "paint", strokes: [] });
       target.content.strokes.push(stroke);
       if (!stroke.erase) rememberColour(rgbToHex(stroke.color.slice(0, 3)));
       scheduleRender();
@@ -1681,7 +2518,7 @@ $("hex").addEventListener("change", (e) => {
     const ink = $("ink"), r = ink.getBoundingClientRect();
     const nx = (e.clientX - r.left) / r.width;
     const ny = (e.clientY - r.top) / r.height;
-    const [sx, sy] = layerLocal(...screenToSource(nx, ny, a), selectedArtLayer()?.content.op === "paint" ? selectedArtLayer()?.transform : null);
+    const [sx, sy] = layerLocal(...screenToSource(nx, ny, a), kindIs(selectedArtLayer(), "paint") ? selectedArtLayer().transform : null);
     inkStroke.points.push(clamp(sx,0,1), clamp(sy,0,1));
   }
 
@@ -1746,8 +2583,8 @@ $("btn-gradient").addEventListener("click", () => (drawTool === "gradient" ? exi
 $("btn-shape").addEventListener("click", () => (drawTool === "shape" ? exitDrawTool() : activateTool("shape")));
 $("btn-gradient-done").addEventListener("click", exitDrawTool);
 $("btn-shape-done").addEventListener("click", exitDrawTool);
-$("btn-clear-gradients").addEventListener("click", () => { edit("Clear gradients", (a) => (a.artLayers = a.artLayers.filter(l => l.content.op !== "gradient"))); syncControls(); });
-$("btn-clear-shapes").addEventListener("click", () => { edit("Clear shapes", (a) => (a.artLayers = a.artLayers.filter(l => l.content.op !== "shapes"))); syncControls(); });
+$("btn-clear-gradients").addEventListener("click", () => { edit("Clear gradients", (a) => (a.artLayers = pruneArt(a.artLayers, l => kindIs(l, "gradient")))); syncControls(); });
+$("btn-clear-shapes").addEventListener("click", () => { edit("Clear shapes", (a) => (a.artLayers = pruneArt(a.artLayers, l => kindIs(l, "shapes")))); syncControls(); });
 
 document.querySelectorAll("#shape-kind .btn").forEach((b) => {
   b.addEventListener("click", () => {
@@ -1821,7 +2658,7 @@ function commitDrag() {
   const [x0, y0] = screenToSource(dragLine.a[0] / ink.width, dragLine.a[1] / ink.height, a);
   const [x1, y1] = screenToSource(dragLine.b[0] / ink.width, dragLine.b[1] / ink.height, a);
 
-  if (a.artLayers.length >= 128) return say("An image can hold up to 128 layers.", true);
+  if (!roomFor(a)) return;
   if (drawTool === "gradient") {
     if (artCount(a, "gradient") >= LIMITS.maxGradients) return say(`An image can hold up to ${LIMITS.maxGradients} gradients.`, true);
     const to = rgba($("g-to").value, $("g-clear").checked ? 0 : 255);
@@ -1936,6 +2773,7 @@ $("btn-export-go").addEventListener("click", async () => {
   // label actually paints before we do. A worker is the real fix.
   await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
 
+  await ensureFonts([adjust.get(activeId)]);
   let bytes, name;
   try {
     const q = Number($("s-quality").value);
@@ -2044,6 +2882,9 @@ async function openProject(file) {
   try { layers = JSON.parse(ed.layers_json()); } catch (e) { return fail(e); }
   for (const l of layers) adjust.set(l.id, parseOps(JSON.parse(ed.get_ops(l.id))));
   activeId = layers.length ? layers[0].id : null;
+  selectArt(null);
+  userFonts = JSON.parse(ed.fonts_json());
+  await ensureFonts();
 
   refreshLayers();
   syncControls();
@@ -2111,7 +2952,8 @@ function onZoom() {
   applyZoom();
   if (cropping) paintCrop();
   if (layerTool) drawLayerTool();
-  if (painting || lassoing || drawTool) { syncInk(); if (lassoing) drawLasso(); }
+  if (painting || lassoing || drawTool || selectTool || retouchTool) { syncInk(); if (lassoing) drawLasso(); if (retouchTool) drawRetouch(); }
+  drawHud();
 }
 
 function zoomStep(dir) {
@@ -2193,6 +3035,14 @@ document.addEventListener("keydown", (e) => {
   const k = e.key.toLowerCase();
 
   if (e.ctrlKey || e.metaKey) {
+    // Letters by physical key: Option changes e.key on a Mac.
+    const code = e.code;
+    if (code === "KeyG") { e.preventDefault(); e.altKey ? toggleClip() : e.shiftKey ? ungroupLayers() : groupLayers(); return; }
+    if (code === "KeyA" && activeId) { e.preventDefault(); selectAll(); return; }
+    if (code === "KeyD" && activeId) { e.preventDefault(); deselect(); return; }
+    if (code === "KeyI" && e.shiftKey && activeId) { e.preventDefault(); invertSelection(); return; }
+    if (code === "Semicolon") { e.preventDefault(); if (e.shiftKey) view.snap = !view.snap; else view.guides = !view.guides; renderGuides(); drawHud(); say(e.shiftKey ? `Snapping ${view.snap ? "on" : "off"}` : `Guides ${view.guides ? "shown" : "hidden"}`); return; }
+    if (code === "Quote") { e.preventDefault(); view.grid = !view.grid; renderGuides(); drawHud(); return; }
     if (k === "z") { e.preventDefault(); e.shiftKey ? redo() : undo(); }
     else if (k === "y") { e.preventDefault(); redo(); }
     else if (k === "=" || k === "+") { e.preventDefault(); zoomStep(1); }
@@ -2221,11 +3071,13 @@ document.addEventListener("keydown", (e) => {
       $("s-brush").value = brush.size;
     } else if (drawTool === "shape") {
       $("sh-width").value = clamp(Number($("sh-width").value) + d * 3, 1, 100);
+    } else if (retouchTool) {
+      $("retouch-size").value = clamp(Number($("retouch-size").value) + d * 3, 1, 100); drawRetouch();
     }
     return;
   }
 
-  const tool = { v: "transform", m: "mask", t: "text", h: "hand", b: "paint", c: "crop", l: "lasso", e: "eraser", g: "gradient", u: "shape", i: "eyedropper" }[k];
+  const tool = { v: "transform", m: "mask", w: "select", s: "clone", j: "heal", o: "dodge", t: "text", h: "hand", b: "paint", c: "crop", l: "lasso", e: "eraser", g: "gradient", u: "shape", i: "eyedropper" }[k];
   if (tool) { e.preventDefault(); activateTool(tool); }
 });
 
@@ -2256,8 +3108,9 @@ window.addEventListener("resize", () => {
   if (activeId) scheduleRender();
   if (cropping) paintCrop();
   if (layerTool) drawLayerTool();
-  if (painting || drawTool) syncInk();
+  if (painting || drawTool || selectTool || retouchTool) syncInk();
   if (lassoing) { syncInk(); drawLasso(); }
+  drawHud();
 });
 
 // Best-effort scrub on unload. The tab teardown does the real work.
@@ -2271,9 +3124,11 @@ function leaveTools() {
   if (painting) exitPaint();
   if (lassoing) exitLasso();
   if (drawTool) exitDrawTool();
+  exitSelect();
+  exitRetouch();
   sampling = false;
   textTool = false;
-  typeDrag = null;
+  typeDrag = null; typeCreate = null; guideDrag = null; snapLines = [];
   if (layerTool) { layerTool = null; layerDrag = null; maskStroke = null; maskCursor = null; $("ink").hidden = true; }
   propertyGesture = null;
   handTool = false;
@@ -2283,6 +3138,8 @@ function leaveTools() {
 
 function currentTool() {
   if (layerTool) return layerTool;
+  if (selectTool) return "select";
+  if (retouchTool) return retouchTool;
   if (textTool) return "text";
   if (cropping) return "crop";
   if (lassoing) return "lasso";
@@ -2293,7 +3150,7 @@ function currentTool() {
   return null;
 }
 
-const TOOL_NAMES = { transform: "Transform layer", mask: "Mask brush", text: "Type — drag to position", crop: "Crop", lasso: "Scissors", paint: "Brush", eraser: "Eraser", gradient: "Gradient", shape: "Shapes", hand: "Hand", eyedropper: "Eyedropper" };
+const TOOL_NAMES = { select: "Select", clone: "Clone stamp", heal: "Healing brush", dodge: "Dodge / burn", transform: "Transform layer", mask: "Mask brush", text: "Type — drag to position", crop: "Crop", lasso: "Scissors", paint: "Brush", eraser: "Eraser", gradient: "Gradient", shape: "Shapes", hand: "Hand", eyedropper: "Eyedropper" };
 
 function updateToolUI() {
   const t = currentTool();
@@ -2314,6 +3171,8 @@ function activateTool(tool) {
   // Choosing the active tool again puts it down, like the panel buttons do.
   if (same) return;
   if (tool === "transform" || tool === "mask") enterLayerTool(tool);
+  if (tool === "select") enterSelect();
+  if (tool === "clone" || tool === "heal" || tool === "dodge") enterRetouch(tool);
   if (tool === "crop") enterCrop();
   if (tool === "lasso") enterLasso();
   if (tool === "paint" || tool === "eraser") {
@@ -2321,7 +3180,7 @@ function activateTool(tool) {
     if ((tool === "eraser") !== brush.erase) $("btn-eraser").click();
   }
   if (tool === "gradient" || tool === "shape") enterDrawTool(tool);
-  if (tool === "text") { textTool = true; $("canvas").style.cursor = "text"; }
+  if (tool === "text") { textTool = true; $("canvas").style.cursor = "text"; requestAnimationFrame(drawHud); }
   if (tool === "hand") handTool = true;
   if (tool === "eyedropper") {
     sampling = true;
@@ -2338,6 +3197,7 @@ $("view-original").onclick = () => {
   comparing = !comparing;
   $("view-original").setAttribute("aria-pressed", String(comparing));
   draw();
+  drawHud();
   // Keep the saved/exported operation list intact while showing the original.
   ed.set_ops(activeId, JSON.stringify(buildOps(adjust.get(activeId))));
 };
@@ -2385,12 +3245,13 @@ function updateHistogram(canvas) {
   hc.stroke();
   if (!curveDrag) drawCurves();
 }
-document.addEventListener("workspacechange", leaveTools);
+document.addEventListener("workspacechange", () => { leaveTools(); updateAnts(); drawHud(); });
 
 (async () => {
   try {
     const mod = await import("./pkg/darkroom.js");
     wasm = await mod.default();
+    wasmMod = mod;
     ed = new mod.Editor();
     curveLut = mod.curve_lut;
     LIMITS = JSON.parse(ed.limits());

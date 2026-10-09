@@ -13,18 +13,60 @@
 use image::{imageops, Rgba, RgbaImage};
 use serde::{Deserialize, Serialize};
 mod composite;
-pub use composite::content_bounds;
+mod retouch;
+pub mod select;
+pub mod text;
+pub use composite::{content_bounds, find_layer, unmap, walk_layers};
+pub use retouch::{check as retouch_check, suggest_offset, RetouchStroke};
+pub use select::Selection;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct Transform { pub tx: f32, pub ty: f32, pub sx: f32, pub sy: f32, pub rotation: f32, pub anchor_x: f32, pub anchor_y: f32 }
 impl Default for Transform { fn default() -> Self { Self { tx:0., ty:0., sx:1., sy:1., rotation:0., anchor_x:0.5, anchor_y:0.5 } } }
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct LayerMask { pub enabled: bool, pub inverted: bool, pub strokes: Vec<Stroke> }
+pub struct LayerMask {
+    pub enabled: bool,
+    pub inverted: bool,
+    pub strokes: Vec<Stroke>,
+    /// A selection the mask starts from: selected areas are white, the rest
+    /// black, and strokes paint on top. Kept as a description rather than
+    /// pixels so it renders sharply at any export size.
+    #[serde(default)]
+    pub selection: Option<Selection>,
+    /// The layer's transform when the selection was applied. Masks live in
+    /// layer space, so this pins the selection to where the layer was then
+    /// and lets it travel with the layer afterwards.
+    #[serde(default)]
+    pub origin: Transform,
+}
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
-pub struct LayerStyle { pub shadow: bool, pub shadow_color: [u8;4], pub shadow_blur: f32, pub shadow_x: f32, pub shadow_y: f32, pub outline: bool, pub outline_color: [u8;4], pub outline_width: f32 }
-impl Default for LayerStyle { fn default() -> Self { Self { shadow:false, shadow_color:[0,0,0,160], shadow_blur:0.015, shadow_x:0.02, shadow_y:0.02, outline:false, outline_color:[255;4], outline_width:0.005 } } }
+pub struct LayerStyle {
+    pub shadow: bool, pub shadow_color: [u8;4], pub shadow_blur: f32, pub shadow_x: f32, pub shadow_y: f32,
+    pub outline: bool, pub outline_color: [u8;4], pub outline_width: f32,
+    pub glow: bool, pub glow_color: [u8;4], pub glow_size: f32,
+    pub inner_glow: bool, pub inner_glow_color: [u8;4], pub inner_glow_size: f32,
+    /// Inner bevel lit from `bevel_angle` degrees, Photoshop's convention:
+    /// 120 is a light from the upper left.
+    pub bevel: bool, pub bevel_size: f32, pub bevel_depth: f32, pub bevel_angle: f32,
+    pub bevel_highlight: [u8;4], pub bevel_shadow: [u8;4],
+}
+impl Default for LayerStyle {
+    fn default() -> Self {
+        Self {
+            shadow:false, shadow_color:[0,0,0,160], shadow_blur:0.015, shadow_x:0.02, shadow_y:0.02,
+            outline:false, outline_color:[255;4], outline_width:0.005,
+            glow:false, glow_color:[255,214,120,190], glow_size:0.02,
+            inner_glow:false, inner_glow_color:[255,255,255,170], inner_glow_size:0.01,
+            bevel:false, bevel_size:0.01, bevel_depth:1.0, bevel_angle:120.0,
+            bevel_highlight:[255,255,255,190], bevel_shadow:[0,0,0,170],
+        }
+    }
+}
+impl LayerStyle {
+    pub fn any(&self) -> bool { self.shadow || self.outline || self.glow || self.inner_glow || self.bevel }
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Stroke {
@@ -42,12 +84,52 @@ pub struct Stroke {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Op {
-    /// Editable overlay layer; content is restricted to paint, shapes, gradient or text.
-    Layer { id: String, name: String, visible: bool, opacity: f32, blend: Blend, content: Box<Op>, #[serde(default)] transform: Transform, #[serde(default)] mask: Option<LayerMask>, #[serde(default)] style: LayerStyle },
+    /// Editable overlay layer. Content is paint, shapes, a gradient, text, a
+    /// photo, a fill, a copy of the source, an adjustment or retouching.
+    Layer {
+        id: String, name: String, visible: bool, opacity: f32, blend: Blend, content: Box<Op>,
+        #[serde(default)] transform: Transform,
+        #[serde(default)] mask: Option<LayerMask>,
+        #[serde(default)] style: LayerStyle,
+        /// Clipped to the nearest unclipped layer below it in the same stack.
+        #[serde(default)] clip: bool,
+    },
+    /// A folder of layers. Pass-through groups let their adjustments reach
+    /// everything below, as in Photoshop; otherwise the children are
+    /// composited on their own first and the result is blended as one layer.
+    Group {
+        id: String, name: String, visible: bool, opacity: f32, blend: Blend,
+        #[serde(default = "yes")] pass_through: bool,
+        children: Vec<Op>,
+        #[serde(default)] mask: Option<LayerMask>,
+        #[serde(default)] clip: bool,
+        #[serde(default)] collapsed: bool,
+    },
     Photo { asset_id: String, width: f32, height: f32 },
     Adjustment { exposure: f32, brightness: f32, contrast: f32, saturation: f32, warmth: f32 },
+    /// Solid colour, normally shaped by a mask made from a selection.
+    Fill { color: [u8; 4] },
+    /// The photograph itself, with the document's tone edits, so a selection
+    /// can be lifted onto its own layer and moved.
+    Source,
+    /// Clone, heal and dodge/burn strokes, sampled from whatever is below.
+    Retouch { strokes: Vec<RetouchStroke> },
+    /// Layout guides in normalized output coordinates. Never rendered.
+    Guides {
+        #[serde(default)] x: Vec<f32>,
+        #[serde(default)] y: Vec<f32>,
+    },
     BaseOpacity { value: f32 },
-    Text { text: String, x: f32, y: f32, size: f32, color: [u8; 4], bold: bool, align: TextAlign, leading: f32 },
+    Text {
+        text: String, x: f32, y: f32, size: f32, color: [u8; 4], bold: bool, align: TextAlign, leading: f32,
+        #[serde(default = "lato")] font: String,
+        #[serde(default)] italic: bool,
+        /// Extra space after each character, in ems.
+        #[serde(default)] tracking: f32,
+        /// Paragraph box width as a fraction of the source width; 0 is point
+        /// text that grows from its anchor without wrapping.
+        #[serde(default)] box_width: f32,
+    },
     /// Normalized against the *source* dimensions, before any rotation.
     Crop { x: f32, y: f32, w: f32, h: f32 },
     /// Quarter turns clockwise, 0..3.
@@ -190,71 +272,26 @@ pub struct Shape {
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 #[serde(rename_all = "snake_case")]
-pub enum TextAlign { Left, Center, Right }
+pub enum TextAlign { Left, Center, Right, Justify }
 
 fn one() -> f32 {
     1.0
 }
+fn yes() -> bool {
+    true
+}
+fn lato() -> String {
+    "lato".into()
+}
 
 fn render_overlay(img: &mut RgbaImage, op: &Op, geo: &[Op], dims: (u32, u32), short: f32) {
     match op {
-        Op::Text { .. } => render_text(img, op, geo, dims, short),
+        Op::Text { .. } => text::render(img, op, geo, dims, short),
         Op::Paint { strokes } => paint(img, strokes, geo, short),
         Op::Shapes { items } => shapes(img, items, geo, short),
         Op::Gradient { kind, x0, y0, x1, y1, from, to, opacity, blend } =>
             gradient(img, *kind, (*x0, *y0), (*x1, *y1), *from, *to, *opacity, *blend, geo),
         _ => {} // Validated before entering the renderer; layers cannot nest.
-    }
-}
-
-fn text_font(bold: bool) -> &'static fontdue::Font {
-    use std::sync::OnceLock;
-    static REGULAR: OnceLock<fontdue::Font> = OnceLock::new();
-    static BOLD: OnceLock<fontdue::Font> = OnceLock::new();
-    let (slot, bytes): (_, &[u8]) = if bold {
-        (&BOLD, include_bytes!("../web/fonts/Lato-Bold.ttf"))
-    } else { (&REGULAR, include_bytes!("../web/fonts/Lato-Regular.ttf")) };
-    slot.get_or_init(|| fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default()).expect("bundled Lato font"))
-}
-
-/// Rasterize live text at the render resolution, then map it through the same
-/// source geometry as brush marks. Never persist a flattened text bitmap.
-fn render_text(img: &mut RgbaImage, op: &Op, geo: &[Op], dims: (u32, u32), short: f32) {
-    let Op::Text { text, x, y, size, color, bold, align, leading } = op else { return };
-    let font = text_font(*bold);
-    let px = (size * short).clamp(1.0, 4096.0);
-    let metrics = font.horizontal_line_metrics(px).unwrap();
-    let rgb = [color[0] as f32 / 255.0, color[1] as f32 / 255.0, color[2] as f32 / 255.0];
-    for (row, line) in text.split('\n').enumerate() {
-        let mut width = 0.0;
-        let mut previous = None;
-        for ch in line.chars() {
-            if let Some(prev) = previous { width += font.horizontal_kern(prev, ch, px).unwrap_or(0.0); }
-            width += font.metrics(ch, px).advance_width;
-            previous = Some(ch);
-        }
-        let mut pen = x * dims.0 as f32 - match align { TextAlign::Left => 0.0, TextAlign::Center => width / 2.0, TextAlign::Right => width };
-        let baseline = y * dims.1 as f32 + metrics.ascent + row as f32 * px * leading;
-        previous = None;
-        for ch in line.chars() {
-            if let Some(prev) = previous { pen += font.horizontal_kern(prev, ch, px).unwrap_or(0.0); }
-            let (m, bitmap) = font.rasterize(ch, px);
-            for gy in 0..m.height {
-                for gx in 0..m.width {
-                    let coverage = bitmap[gy * m.width + gx];
-                    if coverage == 0 { continue; }
-                    let sx = (pen.floor() + m.xmin as f32 + gx as f32 + 0.5) / dims.0 as f32;
-                    let sy = (baseline.floor() - m.ymin as f32 - m.height as f32 + gy as f32 + 0.5) / dims.1 as f32;
-                    let (nx, ny) = map_point(sx, sy, geo);
-                    if !(0.0..1.0).contains(&nx) || !(0.0..1.0).contains(&ny) { continue; }
-                    let ix = (nx * img.width() as f32) as u32;
-                    let iy = (ny * img.height() as f32) as u32;
-                    blend_px(img.get_pixel_mut(ix, iy), rgb, coverage as f32 / 255.0 * color[3] as f32 / 255.0, Blend::Normal);
-                }
-            }
-            pen += m.advance_width;
-            previous = Some(ch);
-        }
     }
 }
 
@@ -276,12 +313,20 @@ pub fn apply_with_assets(src: &RgbaImage, ops: &[Op], assets: &std::collections:
 
     let mut img = src.clone();
     let mut geo: Vec<Op> = Vec::new();
-    for op in ops {
+    let mut i = 0;
+    while i < ops.len() {
+        let op = &ops[i];
         match op {
-            Op::Layer { visible, opacity, .. } => {
-                if *visible && *opacity > 0.0 { composite::composite_layer(&mut img, op, &geo, src.dimensions(), assets, full); }
+            Op::Layer { .. } | Op::Group { .. } => {
+                // A run of layers is one stack: clipping and groups need to
+                // see their neighbours, so the compositor takes them together.
+                let end = ops[i..].iter().position(|o| !matches!(o, Op::Layer { .. } | Op::Group { .. })).map_or(ops.len(), |n| i + n);
+                let ctx = composite::Ctx::new(&geo, src, ops, assets, full);
+                composite::render_items(&mut img, &ops[i..end], &ctx);
+                i = end;
+                continue;
             }
-            Op::Text { .. } => render_text(&mut img, op, &geo, src.dimensions(), base_short),
+            Op::Text { .. } => text::render(&mut img, op, &geo, src.dimensions(), base_short),
             Op::Paint { strokes } => paint(&mut img, strokes, &geo, base_short),
             Op::Gradient { kind, x0, y0, x1, y1, from, to, opacity, blend } => {
                 gradient(&mut img, *kind, (*x0, *y0), (*x1, *y1), *from, *to, *opacity, *blend, &geo)
@@ -305,13 +350,14 @@ pub fn apply_with_assets(src: &RgbaImage, ops: &[Op], assets: &std::collections:
                 img = apply_one(img, op);
             }
         }
+        i += 1;
     }
     img
 }
 
 fn apply_one(img: RgbaImage, op: &Op) -> RgbaImage {
     match *op {
-        Op::Layer { .. } | Op::Text { .. } | Op::Photo { .. } | Op::Adjustment { .. } => img,
+        Op::Layer { .. } | Op::Group { .. } | Op::Text { .. } | Op::Photo { .. } | Op::Adjustment { .. } | Op::Fill { .. } | Op::Source | Op::Retouch { .. } | Op::Guides { .. } => img,
         Op::BaseOpacity { value } => per_pixel(img, |c| [c[0], c[1], c[2], clamp8(c[3] as f32 * value.clamp(0.0, 1.0))]),
         Op::Crop { x, y, w, h } => crop_normalized(&img, x, y, w, h),
         Op::Rotate { turns } => match turns % 4 {
@@ -1039,6 +1085,12 @@ fn add_span(cov: &mut [f32], w: usize, row: usize, x0: f32, x1: f32, weight: f32
 /// Output dimensions without doing the work. One source of truth for the
 /// export dialog, replacing a duplicate of the crop maths in app.js.
 pub fn dims_after(w: u32, h: u32, ops: &[Op]) -> (u32, u32) {
+    geometry_of(w, h, ops).0
+}
+
+/// Output dimensions and the geometry chain that produces them, with lassos
+/// recorded as their equivalent crops exactly as `apply_with_assets` does.
+pub fn geometry_of(w: u32, h: u32, ops: &[Op]) -> ((u32, u32), Vec<Op>) {
     let (mut cw, mut ch) = (w.max(1), h.max(1));
     let mut geo: Vec<Op> = Vec::new();
     for op in ops {
@@ -1067,7 +1119,7 @@ pub fn dims_after(w: u32, h: u32, ops: &[Op]) -> (u32, u32) {
             _ => {}
         }
     }
-    (cw, ch)
+    ((cw, ch), geo)
 }
 
 // --- painting --------------------------------------------------------------
@@ -1282,10 +1334,10 @@ where
 mod tests {
     use super::*;
     fn text_op() -> Op {
-        Op::Text { text: "Hello\nDarkroom".into(), x: 0.15, y: 0.1, size: 0.15, color: [255, 0, 0, 255], bold: false, align: TextAlign::Left, leading: 1.2 }
+        Op::Text { text: "Hello\nDarkroom".into(), x: 0.15, y: 0.1, size: 0.15, color: [255, 0, 0, 255], bold: false, align: TextAlign::Left, leading: 1.2, font: "lato".into(), italic: false, tracking: 0.0, box_width: 0.0 }
     }
     fn overlay(content: Op, opacity: f32, visible: bool) -> Op {
-        Op::Layer { id: "test".into(), name: "Test".into(), visible, opacity, blend: Blend::Normal, content: Box::new(content), transform: Transform::default(), mask: None, style: LayerStyle::default() }
+        Op::Layer { id: "test".into(), name: "Test".into(), visible, opacity, blend: Blend::Normal, content: Box::new(content), transform: Transform::default(), mask: None, style: LayerStyle::default(), clip: false }
     }
     #[test]
     fn text_layers_render_and_respect_visibility_opacity_and_order() {
