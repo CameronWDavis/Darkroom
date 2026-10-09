@@ -778,3 +778,13 @@ body.v-exporting .vtimeline { opacity:1; }
   .vbin, .vinspector { border:0; border-bottom:1px solid var(--line); max-height:320px; }
   .vbin { order:1; } .vmonitor { order:2; } .vinspector { order:3; } .vtimeline { order:4; }
 }
+
+/* Editable overlay stack */
+.art-layers { margin:12px 0; max-height:240px; overflow:auto; }
+.art-row { display:flex; gap:6px; align-items:center; margin:4px 0; }
+.art-row .btn { flex:1; text-align:left; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; }
+.art-row .btn[aria-pressed="true"] { border-color:var(--amber); background:#344665; color:#dceaff; }
+.art-field { display:flex; flex-direction:column; gap:6px; font-size:12px; margin:10px 0; min-width:0; }
+.art-field input:not([type="color"]), .art-field textarea, .art-field select { width:100%; min-width:0; padding:6px; color:var(--text); background:var(--ink); border:1px solid var(--line); border-radius:3px; font:inherit; }
+.art-field textarea { resize:vertical; }
+#text-properties { border-top:1px solid var(--line); margin-top:14px; }

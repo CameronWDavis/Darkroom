@@ -22,6 +22,8 @@ Edits are kept in memory during your session. Save or export your work before cl
 ## Image studio
 
 - Neutral dark workspace with a left tool rail, right properties panel with collapsible sections, and document filmstrip.
+- **Layers:** text, drawings, shapes, and gradients in an ordered stack above the photo, with visibility, naming, opacity, 11 blend modes, duplication, and deletion. Select a drawing layer before painting or erasing; new shapes and gradients get their own layers. The original photo stays at the bottom and can be made transparent with its opacity control.
+- **Editable text:** multiline Lato text in regular or bold, color, size, alignment, line spacing, and position. Use **T** and drag on the canvas to move the selected text layer. Text renders at export resolution and remains editable in saved projects.
 - **Tools:** hand (pan), crop with aspect ratios, lasso cutouts, brush and paint eraser, gradient, shapes, and image color sampling.
 - **Basic:** brightness, contrast, exposure (±2 stops), saturation, and temperature.
 - **Levels:** input black/white points, midtone gamma, output range, and **Auto** levels.
@@ -34,7 +36,7 @@ Edits are kept in memory during your session. Save or export your work before cl
 - Undo/redo, nondestructive project saving, and full-resolution PNG, JPEG, or lossless WebP export, resized from 25% to 200%.
 - Shortcuts: **H** hand (or hold **Space**), **B** brush, **E** eraser, **G** gradient, **U** shapes, **C** crop, **L** lasso, **I** eyedropper, **[ ]** size, **\\** compare, **Escape** exit tool, **Ctrl/Cmd+Z** undo, **Ctrl/Cmd+Shift+Z** redo, **Ctrl/Cmd+= / − / 0** zoom, **Ctrl/Cmd+O / S** open/save project, **Ctrl/Cmd+Shift+E** export, **?** list all shortcuts.
 
-Gradients, shapes, and brushwork are stored in source-image coordinates, so they stay attached to the subject through later crops, rotations, and flips. The filmstrip contains independent image documents; it is not a compositing layer stack. The eraser removes brush marks without removing the source photograph.
+Gradients, shapes, and brushwork are stored in source-image coordinates, so they stay attached to the subject through later crops, rotations, and flips. The filmstrip switches between independent documents; the Layers panel manages the overlay stack within each document. Global color adjustments affect the photo beneath the layers. This release supports overlay layers, not groups, masks, additional photo layers, or PSD import/export. Text uses the bundled Lato fonts; complex-script shaping and emoji are not supported. The eraser removes brush marks from the selected drawing layer without removing the source photograph. Older projects open with their existing artwork migrated into layers; new projects use format v4 and require an updated Darkroom to reopen.
 
 ## Size limits
 
@@ -49,6 +51,7 @@ Everything is processed inside the browser tab, so Darkroom refuses files that w
 | Project contents once decompressed | 768 MB total, 16 MB manifest |
 | Compression ratio inside a project | 100:1 for any entry over 1 MB (zip-bomb protection) |
 | Export | 16,384 px per edge and 64 megapixels after resizing |
+| Image overlay layers / text | 128 layers; 1,000 characters per text layer, 4,000 per image |
 | Video studio: video / audio / image file | 8 GB / 1 GB / 50 MB (images also 16,384 px and 64 MP) |
 | Video studio: media bin and timeline | 64 files, 500 timeline items, 200 markers |
 | Video project (`.json`) and captions (`.srt`) | 5 MB and 2 MB |
@@ -113,7 +116,7 @@ Commit and push the source files, `Cargo.lock`, and `.github/workflows/pages.yml
 3. Download the **darkroom-web** artifact from the completed run's **Artifacts** section and unzip it.
 4. Copy the extracted contents to your website's published directory, or a subfolder such as `darkroom/`.
 
-Keep `index.html`, `styles.css`, `app.js`, `video.js`, `.nojekyll`, and the entire `video/` and `pkg/` folders together. Relative asset paths allow the editor to run in a subfolder. Serve it over HTTPS with `.wasm` files served as `application/wasm`; GitHub Pages handles this for you.
+Keep `index.html`, `styles.css`, `app.js`, `video.js`, `.nojekyll`, and the entire `video/`, `fonts/`, and `pkg/` folders together. Relative asset paths allow the editor to run in a subfolder. Serve it over HTTPS with `.wasm` files served as `application/wasm`; GitHub Pages handles this for you.
 
 If your existing GitHub Pages site publishes from a branch, put these built files in its selected root or `docs` directory (or a subfolder within it). The GitHub Pages branch selector cannot publish directly from a folder named `web`; use the workflow below for this repository instead. Do not upload only the source `web` folder without the compiled `pkg` files—the image editor needs them.
 
@@ -127,6 +130,12 @@ For `CameronWDavis/Darkroom`, the default project URL will be `https://cameronwd
 
 See GitHub's [custom Pages workflow documentation](https://docs.github.com/en/pages/getting-started-with-github-pages/using-custom-workflows-with-github-pages) for publishing settings and permissions. Visitors need only a supported browser; Rust and the build tools are required only to build the site.
 
+## Feature inspiration and fonts
+
+The layer and live-text workflow was inspired by [PhotoCraft](https://github.com/storytold/photocraft). This implementation uses Darkroom's own operation pipeline; it does not embed PhotoCraft's engine or copy its source code.
+
+[Lato](https://www.latofonts.com/) Regular and Bold are bundled with the image engine for consistent local rendering. Copyright © 2010–2014 tyPoland Łukasz Dziedzic; distributed under the [SIL Open Font License](web/fonts/OFL.txt). Font files were obtained from the [Google Fonts Lato directory](https://github.com/google/fonts/tree/main/ofl/lato). Text is never sent to a font service.
+
 ## Validation
 
 ```sh
@@ -134,3 +143,5 @@ cargo test
 for f in web/app.js web/video.js web/video/*.js; do node --input-type=module --check < "$f"; done
 node --test tests/*.test.mjs
 ```
+
+For browser integration coverage, build the image engine, serve `web`, and run `node tests/image_layers.browser.cjs` with Playwright installed. The test covers text, drawing and shape layers, ordering, visibility, undo/redo, project reopening, and image export. Set `DARKROOM_URL` to test another preview URL.

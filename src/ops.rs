@@ -29,6 +29,10 @@ pub struct Stroke {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Op {
+    /// Editable overlay layer; content is restricted to paint, shapes, gradient or text.
+    Layer { id: String, name: String, visible: bool, opacity: f32, blend: Blend, content: Box<Op> },
+    BaseOpacity { value: f32 },
+    Text { text: String, x: f32, y: f32, size: f32, color: [u8; 4], bold: bool, align: TextAlign, leading: f32 },
     /// Normalized against the *source* dimensions, before any rotation.
     Crop { x: f32, y: f32, w: f32, h: f32 },
     /// Quarter turns clockwise, 0..3.
@@ -169,8 +173,74 @@ pub struct Shape {
     pub width: f32,
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum TextAlign { Left, Center, Right }
+
 fn one() -> f32 {
     1.0
+}
+
+fn render_overlay(img: &mut RgbaImage, op: &Op, geo: &[Op], dims: (u32, u32), short: f32) {
+    match op {
+        Op::Text { .. } => render_text(img, op, geo, dims, short),
+        Op::Paint { strokes } => paint(img, strokes, geo, short),
+        Op::Shapes { items } => shapes(img, items, geo, short),
+        Op::Gradient { kind, x0, y0, x1, y1, from, to, opacity, blend } =>
+            gradient(img, *kind, (*x0, *y0), (*x1, *y1), *from, *to, *opacity, *blend, geo),
+        _ => {} // Validated before entering the renderer; layers cannot nest.
+    }
+}
+
+fn text_font(bold: bool) -> &'static fontdue::Font {
+    use std::sync::OnceLock;
+    static REGULAR: OnceLock<fontdue::Font> = OnceLock::new();
+    static BOLD: OnceLock<fontdue::Font> = OnceLock::new();
+    let (slot, bytes): (_, &[u8]) = if bold {
+        (&BOLD, include_bytes!("../web/fonts/Lato-Bold.ttf"))
+    } else { (&REGULAR, include_bytes!("../web/fonts/Lato-Regular.ttf")) };
+    slot.get_or_init(|| fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default()).expect("bundled Lato font"))
+}
+
+/// Rasterize live text at the render resolution, then map it through the same
+/// source geometry as brush marks. Never persist a flattened text bitmap.
+fn render_text(img: &mut RgbaImage, op: &Op, geo: &[Op], dims: (u32, u32), short: f32) {
+    let Op::Text { text, x, y, size, color, bold, align, leading } = op else { return };
+    let font = text_font(*bold);
+    let px = (size * short).clamp(1.0, 4096.0);
+    let metrics = font.horizontal_line_metrics(px).unwrap();
+    let rgb = [color[0] as f32 / 255.0, color[1] as f32 / 255.0, color[2] as f32 / 255.0];
+    for (row, line) in text.split('\n').enumerate() {
+        let mut width = 0.0;
+        let mut previous = None;
+        for ch in line.chars() {
+            if let Some(prev) = previous { width += font.horizontal_kern(prev, ch, px).unwrap_or(0.0); }
+            width += font.metrics(ch, px).advance_width;
+            previous = Some(ch);
+        }
+        let mut pen = x * dims.0 as f32 - match align { TextAlign::Left => 0.0, TextAlign::Center => width / 2.0, TextAlign::Right => width };
+        let baseline = y * dims.1 as f32 + metrics.ascent + row as f32 * px * leading;
+        previous = None;
+        for ch in line.chars() {
+            if let Some(prev) = previous { pen += font.horizontal_kern(prev, ch, px).unwrap_or(0.0); }
+            let (m, bitmap) = font.rasterize(ch, px);
+            for gy in 0..m.height {
+                for gx in 0..m.width {
+                    let coverage = bitmap[gy * m.width + gx];
+                    if coverage == 0 { continue; }
+                    let sx = (pen.floor() + m.xmin as f32 + gx as f32 + 0.5) / dims.0 as f32;
+                    let sy = (baseline.floor() - m.ymin as f32 - m.height as f32 + gy as f32 + 0.5) / dims.1 as f32;
+                    let (nx, ny) = map_point(sx, sy, geo);
+                    if !(0.0..1.0).contains(&nx) || !(0.0..1.0).contains(&ny) { continue; }
+                    let ix = (nx * img.width() as f32) as u32;
+                    let iy = (ny * img.height() as f32) as u32;
+                    blend_px(img.get_pixel_mut(ix, iy), rgb, coverage as f32 / 255.0 * color[3] as f32 / 255.0, Blend::Normal);
+                }
+            }
+            pen += m.advance_width;
+            previous = Some(ch);
+        }
+    }
 }
 
 fn is_geometry(op: &Op) -> bool {
@@ -189,6 +259,18 @@ pub fn apply_all(src: &RgbaImage, ops: &[Op]) -> RgbaImage {
     let mut geo: Vec<Op> = Vec::new();
     for op in ops {
         match op {
+            Op::Layer { visible, opacity, blend, content, .. } => {
+                if *visible && *opacity > 0.0 {
+                    let mut overlay = RgbaImage::new(img.width(), img.height());
+                    render_overlay(&mut overlay, content, &geo, src.dimensions(), base_short);
+                    for (dst, pixel) in img.pixels_mut().zip(overlay.pixels()) {
+                        if pixel[3] > 0 {
+                            blend_px(dst, [pixel[0] as f32 / 255.0, pixel[1] as f32 / 255.0, pixel[2] as f32 / 255.0], pixel[3] as f32 / 255.0 * opacity.clamp(0.0, 1.0), *blend);
+                        }
+                    }
+                }
+            }
+            Op::Text { .. } => render_text(&mut img, op, &geo, src.dimensions(), base_short),
             Op::Paint { strokes } => paint(&mut img, strokes, &geo, base_short),
             Op::Gradient { kind, x0, y0, x1, y1, from, to, opacity, blend } => {
                 gradient(&mut img, *kind, (*x0, *y0), (*x1, *y1), *from, *to, *opacity, *blend, &geo)
@@ -218,6 +300,8 @@ pub fn apply_all(src: &RgbaImage, ops: &[Op]) -> RgbaImage {
 
 fn apply_one(img: RgbaImage, op: &Op) -> RgbaImage {
     match *op {
+        Op::Layer { .. } | Op::Text { .. } => img,
+        Op::BaseOpacity { value } => per_pixel(img, |c| [c[0], c[1], c[2], clamp8(c[3] as f32 * value.clamp(0.0, 1.0))]),
         Op::Crop { x, y, w, h } => crop_normalized(&img, x, y, w, h),
         Op::Rotate { turns } => match turns % 4 {
             1 => imageops::rotate90(&img),
@@ -1186,6 +1270,58 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn text_op() -> Op {
+        Op::Text { text: "Hello\nDarkroom".into(), x: 0.15, y: 0.1, size: 0.15, color: [255, 0, 0, 255], bold: false, align: TextAlign::Left, leading: 1.2 }
+    }
+    fn overlay(content: Op, opacity: f32, visible: bool) -> Op {
+        Op::Layer { id: "test".into(), name: "Test".into(), visible, opacity, blend: Blend::Normal, content: Box::new(content) }
+    }
+    #[test]
+    fn text_layers_render_and_respect_visibility_opacity_and_order() {
+        let src = RgbaImage::from_pixel(320, 200, Rgba([0, 0, 0, 255]));
+        let text = overlay(text_op(), 1.0, true);
+        let out = apply_all(&src, &[text.clone()]);
+        assert!(out.pixels().any(|p| p[0] == 255));
+        assert_eq!(apply_all(&src, &[overlay(text_op(), 1.0, false)]), src);
+        assert_eq!(apply_all(&src, &[overlay(text_op(), 0.0, true)]), src);
+        let faded = apply_all(&src, &[overlay(text_op(), 0.5, true)]);
+        assert!(faded.pixels().any(|p| p[0] >= 127));
+        assert!(faded.pixels().all(|p| p[0] <= 128 && p[3] == 255));
+        let fill = overlay(Op::Shapes { items: vec![Shape { kind: ShapeKind::Rect, x0: 0.0, y0: 0.0, x1: 1.0, y1: 1.0, fill: Some([0, 0, 255, 255]), stroke: None, width: 0.0 }] }, 1.0, true);
+        let above = apply_all(&src, &[fill.clone(), text.clone()]);
+        let below = apply_all(&src, &[text, fill]);
+        assert_ne!(above, below);
+        assert!(below.pixels().all(|p| p[0] == 0));
+    }
+    #[test]
+    fn text_follows_rotate_and_flip_geometry() {
+        let src = RgbaImage::new(320, 200);
+        let plain = apply_all(&src, &[text_op()]);
+        let rotated = apply_all(&src, &[Op::Rotate { turns: 1 }, text_op()]);
+        assert_eq!(rotated, imageops::rotate90(&plain));
+        let flipped = apply_all(&src, &[Op::FlipH, text_op()]);
+        assert_eq!(flipped, imageops::flip_horizontal(&plain));
+    }
+    #[test]
+    fn text_layers_keep_alpha_and_round_trip() {
+        let ops = vec![Op::BaseOpacity { value: 0.0 }, overlay(text_op(), 1.0, true)];
+        let data = serde_json::to_string(&ops).unwrap();
+        let restored: Vec<Op> = serde_json::from_str(&data).unwrap();
+        assert_eq!(ops, restored);
+        let result = apply_all(&white(320, 200), &restored);
+        assert_eq!(result.get_pixel(0, 0)[3], 0);
+        assert!(result.pixels().any(|p| p[3] == 255));
+    }
+    #[test]
+    fn layer_validation_blocks_nested_layers_and_excess_text() {
+        let nested = overlay(overlay(text_op(), 1.0, true), 1.0, true);
+        assert!(crate::limits::check_ops(&[nested]).is_err());
+        let mut text = text_op();
+        if let Op::Text { text, .. } = &mut text { *text = "x".repeat(1001); }
+        assert!(crate::limits::check_ops(&[overlay(text, 1.0, true)]).is_err());
+        assert!(crate::limits::check_ops(&[overlay(text_op(), f32::NAN, true)]).is_err());
+    }
+
 
     #[test]
     fn exposure_and_temperature_preserve_alpha() {

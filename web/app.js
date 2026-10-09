@@ -39,7 +39,7 @@ const blank = () => ({
   hue: 0, vibrance: 0, shadows: 0, highlights: 0,
   filterColor: "#ec8a00", filterDensity: 0,
   noise: 0, noiseMono: false, vignette: 0, pixelate: 0, posterize: 1, threshold: 0,
-  gradients: [], shapes: [], strokes: [], lasso: null,
+  gradients: [], shapes: [], strokes: [], lasso: null, artLayers: [], baseOpacity: 1,
 });
 
 // Every slider in the panel, generated so the range, label and default live in
@@ -70,6 +70,119 @@ const SLIDERS = [
 ];
 const SLIDER_KEYS = SLIDERS.map((s) => s[1]);
 const sliderFmt = (key, v) => (SLIDERS.find((s) => s[1] === key)[5] || String)(v);
+
+// Overlay layers are part of the operation stream, so history, thumbnails,
+// full-resolution exports and .darkroom bundles all use the same compositor.
+let selectedArt = null, textTool = false;
+const makeArt = (name, content) => {
+  const blend = content.op === "gradient" ? content.blend : "normal";
+  if (content.op === "gradient") content = { ...content, blend: "normal" };
+  return { op: "layer", id: crypto.randomUUID(), name, visible: true, opacity: 1, blend, content };
+};
+function addArt(a, name, content) { const layer = makeArt(name, content); a.artLayers.push(layer); selectedArt = layer.id; return layer; }
+const selectedArtLayer = () => adjust.get(activeId)?.artLayers.find(l => l.id === selectedArt);
+const artCount = (a, kind) => a.artLayers.reduce((n, l) => n + (l.content.op === kind ? (kind === "paint" ? l.content.strokes.length : kind === "shapes" ? l.content.items.length : 1) : 0), 0);
+function renderArtPanel() {
+  const a = adjust.get(activeId); if (!a) return;
+  const list = $("art-layers"); list.replaceChildren();
+  for (const layer of [...a.artLayers].reverse()) {
+    const row = document.createElement("div"); row.className = "art-row";
+    const visible = document.createElement("input"); visible.type = "checkbox"; visible.checked = layer.visible;
+    visible.setAttribute("aria-label", `Show ${layer.name}`);
+    visible.onchange = () => { edit("Layer visibility", () => layer.visible = visible.checked); syncControls(); };
+    const select = document.createElement("button"); select.className = "btn sm";
+    select.textContent = `${layer.content.op === "text" ? "T" : "◇"}  ${layer.name}`;
+    select.setAttribute("aria-pressed", String(selectedArt === layer.id));
+    select.onclick = () => { leaveTools(); selectedArt = layer.id; renderArtPanel(); if (layer.content.op === "text") activateTool("text"); };
+    row.append(visible, select); list.append(row);
+  }
+  const base = document.createElement("button"); base.className = "btn sm wide";
+  base.textContent = "▧  Original photo"; base.setAttribute("aria-pressed", String(!selectedArtLayer()));
+  base.onclick = () => { leaveTools(); selectedArt = null; renderArtPanel(); }; list.append(base);
+  const layer = selectedArtLayer(), text = layer?.content.op === "text" ? layer.content : null;
+  $("layer-name").disabled = !layer; $("layer-name").value = layer?.name || "Original photo";
+  $("layer-opacity").value = Math.round((layer?.opacity ?? a.baseOpacity)*100);
+  $("layer-opacity-value").textContent = `${$("layer-opacity").value}%`;
+  $("layer-blend").disabled = !layer; $("layer-blend").value = layer?.blend || "normal";
+  for (const id of ["layer-up", "layer-down", "layer-duplicate", "layer-delete"]) $(id).disabled = !layer;
+  if (layer) { $("layer-up").disabled = a.artLayers.indexOf(layer) === a.artLayers.length-1; $("layer-down").disabled = a.artLayers.indexOf(layer) === 0; }
+  $("text-properties").hidden = !text;
+  if (text) {
+    $("text-content").value = text.text; $("text-bold").checked = text.bold;
+    $("text-color").value = rgbToHex(text.color.slice(0,3)); $("text-align").value = text.align;
+    $("text-size").value = +(text.size*100).toFixed(2); $("text-leading").value = text.leading;
+    $("text-x").value = +(text.x*100).toFixed(2); $("text-y").value = +(text.y*100).toFixed(2);
+  }
+}
+function addTextLayer() {
+  if (!activeId) return say("Import an image first.");
+  const a = adjust.get(activeId); if (a.artLayers.length >= 128) return say("An image can hold up to 128 layers.", true);
+  if(a.artLayers.reduce((n,l)=>n+(l.content.op==="text" ? [...l.content.text].length : 0),0) > 3991) return say("An image can hold up to 4000 text characters.",true);
+  edit("Add text layer", s => addArt(s, "Text", { op: "text", text: "Your text", x: .5, y: .4, size: .08, color: [255,255,255,255], bold: false, align: "center", leading: 1.2 }));
+  leaveTools(); activateTool("text"); syncControls();
+  $("text-content").focus(); $("text-content").select();
+}
+$("layer-add-text").onclick = addTextLayer;
+$("layer-add-paint").onclick = () => {
+  if (!activeId || adjust.get(activeId).artLayers.length >= 128) return say("An image can hold up to 128 layers.", true);
+  edit("Add drawing layer", a => addArt(a, "Drawing", { op: "paint", strokes: [] }));
+  leaveTools(); activateTool("paint"); syncControls();
+};
+$("layer-name").onchange = e => { const l = selectedArtLayer(); if (l) { edit("Rename layer", () => l.name = e.target.value.trim().slice(0,64) || "Layer"); syncControls(); } };
+$("layer-blend").onchange = e => { const l = selectedArtLayer(); if (l) { edit("Layer blend mode", () => l.blend = e.target.value); syncControls(); } };
+let propertyGesture = null;
+function propertyInput(id, apply) {
+  $(id).addEventListener("input", () => {
+    if (!activeId) return;
+    if (propertyGesture !== id) { pushHistory("Layer properties"); propertyGesture = id; }
+    comparing = false; $("view-original").setAttribute("aria-pressed", "false");
+    apply($(id)); scheduleRender();
+  });
+  $(id).addEventListener("change", () => { propertyGesture = null; syncControls(); requestAnimationFrame(refreshLayers); });
+}
+propertyInput("layer-opacity", e => { const l = selectedArtLayer(), value = Number(e.value)/100; if(l) l.opacity=value; else adjust.get(activeId).baseOpacity=value; $("layer-opacity-value").textContent=`${e.value}%`; });
+const updateText = fn => { const l=selectedArtLayer(); if(l?.content.op === "text") fn(l.content); };
+propertyInput("text-content", e => updateText(t => {
+  const others=adjust.get(activeId).artLayers.reduce((n,l)=>n+(l.id!==selectedArt && l.content.op==="text" ? [...l.content.text].length : 0),0);
+  t.text=[...e.value.split("\n").slice(0,50).join("\n")].slice(0,Math.min(1000,4000-others)).join("");
+}));
+propertyInput("text-color", e => updateText(t => t.color=[...hexToRgb(e.value),255]));
+propertyInput("text-bold", e => updateText(t => t.bold=e.checked));
+propertyInput("text-align", e => updateText(t => t.align=e.value));
+for(const [id,key,lo,hi,factor] of [["text-size","size",.1,25,100],["text-leading","leading",.5,3,1],["text-x","x",0,100,100],["text-y","y",0,100,100]]) {
+  propertyInput(id,e=>updateText(t=>t[key]=clamp(Number(e.value)||lo,lo,hi)/factor));
+}
+for(const [id,delta] of [["layer-up",1],["layer-down",-1]]) $(id).onclick=()=>{
+  const a=adjust.get(activeId), l=selectedArtLayer(); if(!l)return;
+  const i=a.artLayers.indexOf(l), j=i+delta; if(j<0 || j>=a.artLayers.length)return;
+  edit("Reorder layer",()=>[a.artLayers[i],a.artLayers[j]]=[a.artLayers[j],a.artLayers[i]]); syncControls();
+};
+$("layer-duplicate").onclick=()=>{
+  const a=adjust.get(activeId), l=selectedArtLayer(); if(!l)return;
+  if(a.artLayers.length>=128)return say("An image can hold up to 128 layers.",true);
+  const copy=structuredClone(l); copy.id=crypto.randomUUID(); copy.name=(l.name+" copy").slice(0,64);
+  // Ask the same engine validator used by save/open before committing limits.
+  try { ed.set_ops(activeId,JSON.stringify([...buildOps(a),copy])); } catch(e) { return fail(e); }
+  edit("Duplicate layer",()=>{ a.artLayers.splice(a.artLayers.indexOf(l)+1,0,copy); selectedArt=copy.id; }); syncControls();
+};
+$("layer-delete").onclick=()=>{ const l=selectedArtLayer(); if(!l)return; leaveTools(); edit("Delete layer",a=>a.artLayers=a.artLayers.filter(x=>x.id!==l.id)); selectedArt=null; syncControls(); };
+let typeDrag = null;
+$("canvas").addEventListener("pointerdown", e => {
+  if(!textTool || panning() || e.button!==0)return;
+  const l=selectedArtLayer(); if(l?.content.op!=="text") { addTextLayer(); return; }
+  if(!l.visible)return say("Show this layer before positioning it.");
+  const r=$("canvas").getBoundingClientRect(), a=adjust.get(activeId);
+  const [x,y]=screenToSource((e.clientX-r.left)/r.width,(e.clientY-r.top)/r.height,a);
+  pushHistory("Move text"); typeDrag={x,y,startX:l.content.x,startY:l.content.y};
+  $("canvas").setPointerCapture(e.pointerId); e.preventDefault();
+});
+$("canvas").addEventListener("pointermove",e=>{
+  if(!typeDrag)return;
+  const r=$("canvas").getBoundingClientRect(), a=adjust.get(activeId);
+  const [x,y]=screenToSource((e.clientX-r.left)/r.width,(e.clientY-r.top)/r.height,a);
+  updateText(t=>{t.x=clamp(typeDrag.startX+x-typeDrag.x,0,1);t.y=clamp(typeDrag.startY+y-typeDrag.y,0,1);}); scheduleRender();
+});
+for(const event of ["pointerup","pointercancel"]) $("canvas").addEventListener(event,()=>{ if(typeDrag){typeDrag=null;syncControls();requestAnimationFrame(refreshLayers);} });
 
 // --- ops translation -------------------------------------------------------
 // Canonical order is geometry, then tone, then colour, then effects, then
@@ -122,11 +235,13 @@ function buildOps(a, { skipGeometry = false } = {}) {
   if (a.pixelate) ops.push({ op: "pixelate", size: a.pixelate / 100 });
   if (a.noise) ops.push({ op: "noise", amount: a.noise / 100, mono: a.noiseMono });
   if (a.vignette) ops.push({ op: "vignette", amount: a.vignette / 100 });
+  if (a.baseOpacity !== 1) ops.push({ op: "base_opacity", value: a.baseOpacity });
   for (const g of a.gradients) ops.push({ op: "gradient", ...g });
   if (a.shapes.length) ops.push({ op: "shapes", items: a.shapes });
   // Paint goes last so a stroke sits on top of the tone adjustments instead of
   // being desaturated along with the photograph.
   if (a.strokes.length) ops.push({ op: "paint", strokes: a.strokes });
+  ops.push(...a.artLayers);
   return ops;
 }
 
@@ -135,6 +250,8 @@ function parseOps(ops) {
   const pct = (v) => Math.round(v * 100);
   for (const o of ops) {
     switch (o.op) {
+      case "layer": a.artLayers.push(o); break;
+      case "base_opacity": a.baseOpacity = o.value; break;
       case "exposure": case "warmth": case "sharpen": case "vibrance": a[o.op] = pct(o.value); break;
       case "crop": a.crop = { x: o.x, y: o.y, w: o.w, h: o.h }; break;
       case "rotate": a.turns = o.turns % 4; break;
@@ -170,6 +287,13 @@ function parseOps(ops) {
       case "shapes": a.shapes = o.items || []; break;
     }
   }
+  // v1–v3 documents had a fixed gradient -> shapes -> paint order.
+  const migrated = [];
+  for (const g of a.gradients) migrated.push(makeArt("Gradient", { op: "gradient", ...g }));
+  if (a.shapes.length) migrated.push(makeArt("Shapes", { op: "shapes", items: a.shapes }));
+  if (a.strokes.length) migrated.push(makeArt("Drawing", { op: "paint", strokes: a.strokes }));
+  a.artLayers.unshift(...migrated);
+  a.gradients = []; a.shapes = []; a.strokes = [];
   return a;
 }
 
@@ -291,7 +415,7 @@ function draw() {
     ed.render_preview(activeId, previewCap());
   } catch (e) { return fail(e); }
 
-  if (comparing) ed.set_ops(activeId, JSON.stringify(buildOps(a)));
+  ed.set_ops(activeId, JSON.stringify(buildOps(a)));
   const w = ed.preview_width(), h = ed.preview_height();
   // The view must be built after every wasm call in this frame: growing wasm
   // memory detaches the old ArrayBuffer.
@@ -458,9 +582,10 @@ function syncControls() {
   $("c-noiseMono").checked = a.noiseMono;
   $("filter-color").value = a.filterColor;
   $("btn-uncrop").hidden = !a.crop;
-  $("btn-clear-ink").hidden = !a.strokes.length;
-  $("btn-clear-gradients").hidden = !a.gradients.length;
-  $("btn-clear-shapes").hidden = !a.shapes.length;
+  renderArtPanel();
+  $("btn-clear-ink").hidden = !artCount(a, "paint");
+  $("btn-clear-gradients").hidden = !artCount(a, "gradient");
+  $("btn-clear-shapes").hidden = !artCount(a, "shapes");
   $("btn-unlasso").hidden = !a.lasso;
   drawCurves();
 }
@@ -1259,7 +1384,7 @@ function exitPaint() {
 $("btn-paint").addEventListener("click", () => (painting ? exitPaint() : activateTool("paint")));
 $("btn-paint-done").addEventListener("click", exitPaint);
 $("btn-clear-ink").addEventListener("click", () => {
-  edit("Clear drawing", (a) => (a.strokes = []));
+  edit("Clear drawing", (a) => (a.artLayers = a.artLayers.filter(l => l.content.op !== "paint")));
   syncControls();
 });
 
@@ -1311,9 +1436,12 @@ $("hex").addEventListener("change", (e) => {
     // pointer. Without this the brush also fires during a scissors click and
     // commits a one-point stroke, which renders as a stray dot.
     if (!painting || !activeId || e.button !== 0) return;
-    if (adjust.get(activeId).strokes.length >= (LIMITS?.maxStrokes ?? Infinity)) {
+    if (artCount(adjust.get(activeId), "paint") >= (LIMITS?.maxStrokes ?? Infinity)) {
       return say(`This image has reached the limit of ${LIMITS.maxStrokes} brush strokes.`, true);
     }
+    const picked = selectedArtLayer();
+    if (brush.erase && (!picked || picked.content.op !== "paint" || !picked.visible)) return say("Select a visible drawing layer to erase.");
+    if ((!picked || picked.content.op !== "paint" || !picked.visible) && adjust.get(activeId).artLayers.length >= 128) return say("An image can hold up to 128 layers.", true);
     ink.setPointerCapture(e.pointerId);
     const [rgb, a] = [brushRgb(), adjust.get(activeId)];
     inkStroke = {
@@ -1348,7 +1476,12 @@ $("hex").addEventListener("change", (e) => {
       if (stroke.points.length < 2) return;
       // One history entry per stroke, so Ctrl+Z lifts the last line.
       pushHistory(stroke.erase ? "Eraser" : "Brush stroke");
-      adjust.get(activeId).strokes.push(stroke);
+      let target = selectedArtLayer();
+      if (!target || target.content.op !== "paint" || !target.visible) {
+        target = makeArt("Drawing", { op: "paint", strokes: [] });
+        adjust.get(activeId).artLayers.push(target); selectedArt = target.id;
+      }
+      target.content.strokes.push(stroke);
       if (!stroke.erase) rememberColour(rgbToHex(stroke.color.slice(0, 3)));
       scheduleRender();
       syncControls();
@@ -1425,8 +1558,8 @@ $("btn-gradient").addEventListener("click", () => (drawTool === "gradient" ? exi
 $("btn-shape").addEventListener("click", () => (drawTool === "shape" ? exitDrawTool() : activateTool("shape")));
 $("btn-gradient-done").addEventListener("click", exitDrawTool);
 $("btn-shape-done").addEventListener("click", exitDrawTool);
-$("btn-clear-gradients").addEventListener("click", () => { edit("Clear gradients", (a) => (a.gradients = [])); syncControls(); });
-$("btn-clear-shapes").addEventListener("click", () => { edit("Clear shapes", (a) => (a.shapes = [])); syncControls(); });
+$("btn-clear-gradients").addEventListener("click", () => { edit("Clear gradients", (a) => (a.artLayers = a.artLayers.filter(l => l.content.op !== "gradient"))); syncControls(); });
+$("btn-clear-shapes").addEventListener("click", () => { edit("Clear shapes", (a) => (a.artLayers = a.artLayers.filter(l => l.content.op !== "shapes"))); syncControls(); });
 
 document.querySelectorAll("#shape-kind .btn").forEach((b) => {
   b.addEventListener("click", () => {
@@ -1500,16 +1633,17 @@ function commitDrag() {
   const [x0, y0] = screenToSource(dragLine.a[0] / ink.width, dragLine.a[1] / ink.height, a);
   const [x1, y1] = screenToSource(dragLine.b[0] / ink.width, dragLine.b[1] / ink.height, a);
 
+  if (a.artLayers.length >= 128) return say("An image can hold up to 128 layers.", true);
   if (drawTool === "gradient") {
-    if (a.gradients.length >= LIMITS.maxGradients) return say(`An image can hold up to ${LIMITS.maxGradients} gradients.`, true);
+    if (artCount(a, "gradient") >= LIMITS.maxGradients) return say(`An image can hold up to ${LIMITS.maxGradients} gradients.`, true);
     const to = rgba($("g-to").value, $("g-clear").checked ? 0 : 255);
-    edit("Gradient", (s) => s.gradients.push({
+    edit("Gradient", (s) => addArt(s, "Gradient", { op: "gradient",
       kind: $("g-kind").value, x0, y0, x1, y1,
       from: rgba($("g-from").value, 255), to,
       opacity: Number($("g-opacity").value) / 100, blend: $("g-blend").value,
     }));
   } else {
-    if (a.shapes.length >= LIMITS.maxShapes) return say(`An image can hold up to ${LIMITS.maxShapes} shapes.`, true);
+    if (artCount(a, "shapes") >= LIMITS.maxShapes) return say(`An image can hold up to ${LIMITS.maxShapes} shapes.`, true);
     const line = shapeKind === "line";
     const fill = !line && $("sh-fill-on").checked ? rgba($("sh-fill").value, 255) : null;
     // A line is all stroke; with Stroke unticked it borrows the fill colour.
@@ -1517,7 +1651,7 @@ function commitDrag() {
     const stroke = strokeHex ? rgba(strokeHex, 255) : null;
     if (!fill && !stroke) return say("Turn on Fill or Stroke to draw a shape.");
     const names = { rect: "Rectangle", ellipse: "Ellipse", line: "Line" };
-    edit(names[shapeKind], (s) => s.shapes.push({ kind: shapeKind, x0, y0, x1, y1, fill, stroke, width: shapeWidthFraction() }));
+    edit(names[shapeKind], (s) => addArt(s, names[shapeKind], { op: "shapes", items: [{ kind: shapeKind, x0, y0, x1, y1, fill, stroke, width: shapeWidthFraction() }] }));
   }
   syncControls();
 }
@@ -1617,6 +1751,7 @@ $("btn-export-go").addEventListener("click", async () => {
   let bytes, name;
   try {
     const q = Number($("s-quality").value);
+    ed.set_ops(activeId, JSON.stringify(buildOps(adjust.get(activeId))));
     bytes = ed.export(activeId, exportFmt, q, Number($("x-scale").value));
     name = ed.export_name(activeId, exportFmt);
   } catch (e) {
@@ -1731,7 +1866,10 @@ async function openProject(file) {
 
 $("btn-save").addEventListener("click", async () => {
   let bytes;
-  try { bytes = ed.save_bundle(); } catch (e) { return fail(e); }
+  try {
+    for (const [id, state] of adjust) ed.set_ops(id, JSON.stringify(buildOps(state)));
+    bytes = ed.save_bundle();
+  } catch (e) { return fail(e); }
   const ok = await putFile(new Blob([bytes], { type: "application/zip" }), "project.darkroom", {
     description: "Darkroom project", accept: { "application/zip": [".darkroom"] },
   });
@@ -1898,7 +2036,7 @@ document.addEventListener("keydown", (e) => {
     return;
   }
 
-  const tool = { h: "hand", b: "paint", c: "crop", l: "lasso", e: "eraser", g: "gradient", u: "shape", i: "eyedropper" }[k];
+  const tool = { t: "text", h: "hand", b: "paint", c: "crop", l: "lasso", e: "eraser", g: "gradient", u: "shape", i: "eyedropper" }[k];
   if (tool) { e.preventDefault(); activateTool(tool); }
 });
 
@@ -1944,12 +2082,16 @@ function leaveTools() {
   if (lassoing) exitLasso();
   if (drawTool) exitDrawTool();
   sampling = false;
+  textTool = false;
+  typeDrag = null;
+  propertyGesture = null;
   handTool = false;
   $("canvas").style.cursor = "";
   updateToolUI();
 }
 
 function currentTool() {
+  if (textTool) return "text";
   if (cropping) return "crop";
   if (lassoing) return "lasso";
   if (painting) return brush.erase ? "eraser" : "paint";
@@ -1959,7 +2101,7 @@ function currentTool() {
   return null;
 }
 
-const TOOL_NAMES = { crop: "Crop", lasso: "Scissors", paint: "Brush", eraser: "Eraser", gradient: "Gradient", shape: "Shapes", hand: "Hand", eyedropper: "Eyedropper" };
+const TOOL_NAMES = { text: "Type — drag to position", crop: "Crop", lasso: "Scissors", paint: "Brush", eraser: "Eraser", gradient: "Gradient", shape: "Shapes", hand: "Hand", eyedropper: "Eyedropper" };
 
 function updateToolUI() {
   const t = currentTool();
@@ -1986,6 +2128,7 @@ function activateTool(tool) {
     if ((tool === "eraser") !== brush.erase) $("btn-eraser").click();
   }
   if (tool === "gradient" || tool === "shape") enterDrawTool(tool);
+  if (tool === "text") { textTool = true; $("canvas").style.cursor = "text"; }
   if (tool === "hand") handTool = true;
   if (tool === "eyedropper") {
     sampling = true;

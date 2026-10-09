@@ -126,8 +126,34 @@ pub fn check_ops(ops: &[Op]) -> Result<(), String> {
     let mut points = 0usize;
     let mut shapes = 0usize;
     let mut gradients = 0usize;
+    let mut flattened = Vec::new();
+    let mut layer_count = 0;
     for op in ops {
+        if let Op::Layer { id, name, opacity, content, .. } = op {
+            layer_count += 1;
+            if id.len() > 100 || name.len() > 300 || !opacity.is_finite() || !(0.0..=1.0).contains(opacity) {
+                return Err("Invalid layer properties.".into());
+            }
+            if !matches!(content.as_ref(), Op::Text { .. } | Op::Paint { .. } | Op::Shapes { .. } | Op::Gradient { .. }) {
+                return Err("Layers can contain text, paint, shapes or gradients; nested layers are unsupported.".into());
+            }
+            flattened.push(content.as_ref());
+        } else { flattened.push(op); }
+    }
+    if layer_count > 128 { return Err("An image can contain up to 128 overlay layers.".into()); }
+    let mut text_chars = 0;
+    for op in flattened {
         match op {
+            Op::Text { text, x, y, size, leading, .. } => {
+                text_chars += text.chars().count();
+                if text.chars().count() > 1000 || text.lines().count() > 50 || !x.is_finite() || !y.is_finite()
+                    || !(0.0..=1.0).contains(x) || !(0.0..=1.0).contains(y)
+                    || !size.is_finite() || !(0.001..=0.25).contains(size)
+                    || !leading.is_finite() || !(0.5..=3.0).contains(leading) {
+                    return Err("Text exceeds the supported length, position or size limits.".into());
+                }
+            }
+            Op::BaseOpacity { value } if !value.is_finite() || !(0.0..=1.0).contains(value) => return Err("Invalid background opacity.".into()),
             Op::Paint { strokes: s } => {
                 strokes += s.len();
                 points += s.iter().map(|s| s.points.len() / 2).sum::<usize>();
@@ -145,6 +171,7 @@ pub fn check_ops(ops: &[Op]) -> Result<(), String> {
             _ => {}
         }
     }
+    if text_chars > 4000 { return Err("An image can contain up to 4000 text characters.".into()); }
     if strokes > MAX_STROKES || points > MAX_STROKE_POINTS {
         return Err(format!(
             "Too much brushwork on one image ({strokes} strokes, {points} points). \

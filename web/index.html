@@ -39,6 +39,7 @@
     <button class="btn" data-tool="gradient" title="Gradient (G)" aria-label="Gradient">◐</button>
     <button class="btn" data-tool="shape" title="Shapes (U)" aria-label="Shapes">▭</button>
     <button class="btn" data-tool="eyedropper" id="tool-eyedropper" title="Sample image color (I)" aria-label="Eyedropper">◉</button>
+    <button class="btn" data-tool="text" title="Type (T) — select or add a text layer" aria-label="Type">T</button>
     <span class="rail-gap"></span>
     <button class="btn" id="btn-shortcuts" title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts">?</button>
   </nav>
@@ -54,6 +55,26 @@
         <button class="btn sm" id="btn-undo" disabled title="Undo (Ctrl+Z)">↶ Undo</button>
         <button class="btn sm" id="btn-redo" disabled title="Redo (Ctrl+Shift+Z)">↷ Redo</button>
       </div>
+
+      <details class="group" id="layers-panel" open>
+        <summary>Layers</summary>
+        <div class="row-btns two"><button class="btn sm" id="layer-add-text">+ Text</button><button class="btn sm" id="layer-add-paint">+ Drawing</button></div>
+        <div id="art-layers" class="art-layers" aria-label="Layers, topmost first"></div>
+        <label class="art-field">Name<input id="layer-name" maxlength="64"></label>
+        <label class="slider"><span>Opacity</span><output id="layer-opacity-value">100%</output><input type="range" id="layer-opacity" min="0" max="100" value="100"></label>
+        <label class="art-field">Blend<select id="layer-blend"><option value="normal">Normal</option><option value="multiply">Multiply</option><option value="screen">Screen</option><option value="overlay">Overlay</option><option value="soft_light">Soft light</option><option value="hard_light">Hard light</option><option value="darken">Darken</option><option value="lighten">Lighten</option><option value="difference">Difference</option><option value="color_dodge">Color dodge</option><option value="color_burn">Color burn</option></select></label>
+        <div class="row-btns two"><button class="btn sm" id="layer-up">Move up</button><button class="btn sm" id="layer-down">Move down</button><button class="btn sm" id="layer-duplicate">Duplicate</button><button class="btn sm" id="layer-delete">Delete</button></div>
+        <div id="text-properties" hidden>
+          <label class="art-field">Text<textarea id="text-content" rows="3" maxlength="1000" spellcheck="true"></textarea></label>
+          <div class="row-btns two"><label class="art-field">Size (% of short edge)<input type="number" id="text-size" min="0.1" max="25" step="0.1"></label><label class="art-field">Line spacing<input type="number" id="text-leading" min="0.5" max="3" step="0.1"></label></div>
+          <div class="row-btns two"><label class="art-field">X (%)<input id="text-x" type="number" min="0" max="100" step="0.1"></label><label class="art-field">Y (%)<input id="text-y" type="number" min="0" max="100" step="0.1"></label></div>
+          <label class="art-field">Alignment<select id="text-align"><option value="left">Left</option><option value="center">Center</option><option value="right">Right</option></select></label>
+          <label class="art-field">Color<input type="color" id="text-color" value="#ffffff"></label>
+          <label class="check"><input id="text-bold" type="checkbox">Bold</label>
+          <p class="note">Lato · Drag on the canvas with Type (T) to move the selected text. Text stays editable when saved.</p>
+        </div>
+        <p class="note">Layers composite above the adjusted photo. Shapes and gradients create new layers; the brush uses the selected drawing layer.</p>
+      </details>
 
       <details class="group" open>
         <summary>History</summary>

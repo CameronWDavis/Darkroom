@@ -26,7 +26,7 @@ pub const FORMAT: &str = "darkroom-project";
 /// v2 added the `paint` op; v3 added levels, curves, colour, effects,
 /// gradients and shapes. Older bundles still load: serde simply never sees
 /// the ops they did not have.
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Manifest {

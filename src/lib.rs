@@ -220,7 +220,7 @@ impl Editor {
             .ops
             .iter()
             .filter(|o| {
-                !matches!(o, Op::Levels { .. } | Op::Curves { .. } | Op::Paint { .. } | Op::Shapes { .. } | Op::Gradient { .. })
+                !matches!(o, Op::Layer { .. } | Op::Text { .. } | Op::BaseOpacity { .. } | Op::Levels { .. } | Op::Curves { .. } | Op::Paint { .. } | Op::Shapes { .. } | Op::Gradient { .. })
             })
             .cloned()
             .collect();
