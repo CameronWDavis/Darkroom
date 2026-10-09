@@ -19,14 +19,16 @@ use crate::ops::Op;
 use image::{imageops::FilterType, ImageReader, RgbaImage};
 use serde::{Deserialize, Serialize};
 use std::io::{Cursor, Read, Write};
+use std::collections::BTreeMap;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 pub const FORMAT: &str = "darkroom-project";
 /// v2 added the `paint` op; v3 added levels, curves, colour, effects,
-/// gradients and shapes. Older bundles still load: serde simply never sees
+/// gradients and shapes; v4 added editable overlays and text; v5 adds photo
+/// assets, layer transforms, masks, adjustments and styles. Older bundles still load: serde simply never sees
 /// the ops they did not have.
-pub const VERSION: u32 = 4;
+pub const VERSION: u32 = 5;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Manifest {
@@ -40,11 +42,22 @@ pub struct Entry {
     pub id: String,
     pub name: String,
     pub media: String,
+    #[serde(default)]
+    pub assets: BTreeMap<String, String>,
     pub ops: Vec<Op>,
 }
 
 /// Runtime state for one imported image. `source` is the untouched file as
 /// imported; `decoded` and `thumb` are caches we can drop at any time.
+pub struct Asset { pub source: Vec<u8>, pub preview: RgbaImage }
+impl Asset {
+    pub fn new(source: Vec<u8>) -> Result<Self, String> {
+        let decoded = limits::decode("Photo layer", &source)?;
+        Ok(Self { preview: crate::fit(&decoded, 1024, FilterType::Triangle), source })
+    }
+    pub fn bytes(&self) -> u64 { (self.source.len() + self.preview.as_raw().len()) as u64 }
+}
+
 pub struct Layer {
     pub id: String,
     pub name: String,
@@ -52,6 +65,7 @@ pub struct Layer {
     pub source: Vec<u8>,
     pub ops: Vec<Op>,
     pub decoded: Option<RgbaImage>,
+    pub assets: BTreeMap<String, Asset>,
     /// Read from the file header, so listing documents never needs a decode.
     dims: Option<(u32, u32)>,
     /// A small copy of the source for filmstrip thumbnails. Without it every
@@ -61,7 +75,20 @@ pub struct Layer {
 
 impl Layer {
     pub fn new(id: String, name: String, ext: String, source: Vec<u8>, ops: Vec<Op>) -> Layer {
-        Layer { id, name, ext, source, ops, decoded: None, dims: None, thumb: None }
+        Layer { id, name, ext, source, ops, assets: BTreeMap::new(), decoded: None, dims: None, thumb: None }
+    }
+
+    pub fn bytes(&self) -> u64 { self.source.len() as u64 + self.assets.values().map(Asset::bytes).sum::<u64>() }
+
+    pub fn check_assets(&self, ops: &[Op]) -> Result<(), String> {
+        for op in ops {
+            if let Op::Layer { content, .. } = op {
+                if let Op::Photo { asset_id, .. } = content.as_ref() {
+                    if !self.assets.contains_key(asset_id) { return Err("A photo layer is missing its original image.".into()); }
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn decode(&mut self) -> Result<&RgbaImage, String> {
@@ -111,6 +138,8 @@ impl Layer {
     /// -- the allocator may already have copied them, and the OS may have
     /// paged them out -- but it removes the obvious in-process copy.
     pub fn wipe(&mut self) {
+        for a in self.assets.values_mut() { a.source.fill(0); a.preview.as_mut().fill(0); }
+        self.assets.clear();
         self.source.iter_mut().for_each(|b| *b = 0);
         self.source.clear();
         self.source.shrink_to_fit();
@@ -135,7 +164,21 @@ pub fn write_bundle(layers: &[Layer]) -> Result<Vec<u8>, String> {
         let path = format!("media/{}.{}", l.id, l.ext);
         zip.start_file(&path, stored).map_err(z)?;
         zip.write_all(&l.source).map_err(|e| e.to_string())?;
+        l.check_assets(&l.ops)?;
+        let mut assets = BTreeMap::new();
+        for op in &l.ops {
+            if let Op::Layer { content, .. } = op {
+                if let Op::Photo { asset_id, .. } = content.as_ref() {
+                    if assets.contains_key(asset_id) { continue; }
+                    let path = format!("assets/{}/{}.bin", entries.len(), assets.len());
+                    zip.start_file(&path, stored).map_err(z)?;
+                    zip.write_all(&l.assets[asset_id].source).map_err(|e| e.to_string())?;
+                    assets.insert(asset_id.clone(), path);
+                }
+            }
+        }
         entries.push(Entry {
+            assets,
             id: l.id.clone(),
             name: l.name.clone(),
             media: path,
@@ -198,6 +241,8 @@ pub fn read_bundle(bytes: &[u8]) -> Result<Vec<Layer>, String> {
         ));
     }
 
+    if manifest.entries.iter().map(|e| e.assets.len()).sum::<usize>() > 64 { return Err("A project supports up to 64 imported photo assets.".into()); }
+    let mut held = 0;
     let mut layers = Vec::with_capacity(manifest.entries.len());
     for e in manifest.entries {
         check_ops(&e.ops).map_err(|m| format!("'{}': {m}", e.name))?;
@@ -205,7 +250,17 @@ pub fn read_bundle(bytes: &[u8]) -> Result<Vec<Layer>, String> {
             err.unwrap_or_else(|| format!("The bundle is missing {} (referenced by '{}').", e.media, e.name))
         })?;
         let ext = e.media.rsplit('.').next().unwrap_or("bin").to_string();
-        layers.push(Layer::new(e.id, e.name, ext, buf, e.ops));
+        let mut layer = Layer::new(e.id, e.name, ext, buf, e.ops);
+        for (id, path) in e.assets {
+            if id.len() > 100 { return Err("Invalid photo asset ID.".into()); }
+            let bytes = read_entry(&mut zip, &path, MAX_IMAGE_BYTES, &mut budget)
+                .map_err(|e| e.unwrap_or_else(|| "Missing photo asset.".into()))?;
+            layer.assets.insert(id, Asset::new(bytes)?);
+        }
+        layer.check_assets(&layer.ops)?;
+        held += layer.bytes();
+        if held > limits::MAX_SESSION_BYTES { return Err("The project exceeds the image memory budget.".into()); }
+        layers.push(layer);
     }
     Ok(layers)
 }
@@ -300,7 +355,7 @@ mod tests {
 
     fn manifest(n: usize) -> Vec<u8> {
         let entries: Vec<Entry> = (0..n)
-            .map(|i| Entry { id: format!("l{i}"), name: format!("{i}.png"), media: "media/a.png".into(), ops: vec![] })
+            .map(|i| Entry { id: format!("l{i}"), name: format!("{i}.png"), assets: BTreeMap::new(), media: "media/a.png".into(), ops: vec![] })
             .collect();
         serde_json::to_vec(&Manifest { format: FORMAT.into(), version: VERSION, entries }).unwrap()
     }
@@ -314,6 +369,31 @@ mod tests {
         assert_eq!(back[0].ops, vec![Op::Invert]);
         assert_eq!(back[0].source, layers[0].source);
         assert_eq!(layers[0].dims().unwrap(), (4, 3));
+    }
+
+    #[test]
+    fn photo_assets_round_trip_deduplicate_and_drop_unused_originals() {
+        let photo: Op = serde_json::from_value(serde_json::json!({"op":"layer","id":"photo","name":"Photo","visible":true,"opacity":1,"blend":"normal","content":{"op":"photo","asset_id":"p1","width":0.5,"height":0.5},"transform":{"tx":0.1,"rotation":30},"mask":{"enabled":true,"inverted":false,"strokes":[]},"style":{"outline":true,"outline_width":0.01,"outline_color":[255,255,255,255]}})).unwrap();
+        let mut l=Layer::new("l1".into(),"base.png".into(),"png".into(),png(100,80),vec![photo.clone(),photo]);
+        let original=png(30,20);
+        l.assets.insert("p1".into(),Asset::new(original.clone()).unwrap());
+        l.assets.insert("unused".into(),Asset::new(png(10,10)).unwrap());
+        let expected=crate::ops::apply_with_assets(&limits::decode("base",&l.source).unwrap(),&l.ops,&l.assets,true);
+        let bytes=write_bundle(&[l]).unwrap();
+        assert_eq!(ZipArchive::new(Cursor::new(&bytes)).unwrap().len(),3);
+        let back=read_bundle(&bytes).unwrap();assert_eq!(back[0].assets.len(),1);assert_eq!(back[0].assets["p1"].source,original);
+        assert_eq!(expected,crate::ops::apply_with_assets(&limits::decode("base",&back[0].source).unwrap(),&back[0].ops,&back[0].assets,true));
+    }
+
+    #[test]
+    fn missing_and_corrupt_photo_assets_are_rejected() {
+        let mut manifest: serde_json::Value=serde_json::from_slice(&manifest(1)).unwrap();
+        manifest["entries"][0]["assets"]=serde_json::json!({"p1":"assets/photo.png"});
+        let json=serde_json::to_vec(&manifest).unwrap();let base=png(4,3);
+        let missing=bundle(&[("manifest.json",&json,CompressionMethod::Stored),("media/a.png",&base,CompressionMethod::Stored)]);
+        assert!(read_bundle(&missing).err().unwrap().contains("Missing photo asset"));
+        let corrupt=bundle(&[("manifest.json",&json,CompressionMethod::Stored),("media/a.png",&base,CompressionMethod::Stored),("assets/photo.png",b"broken",CompressionMethod::Stored)]);
+        assert!(read_bundle(&corrupt).is_err());
     }
 
     /// 64 MB of zeros deflates to roughly 64 KB: a 1000:1 bomb. It must be

@@ -12,6 +12,19 @@
 
 use image::{imageops, Rgba, RgbaImage};
 use serde::{Deserialize, Serialize};
+mod composite;
+pub use composite::content_bounds;
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct Transform { pub tx: f32, pub ty: f32, pub sx: f32, pub sy: f32, pub rotation: f32, pub anchor_x: f32, pub anchor_y: f32 }
+impl Default for Transform { fn default() -> Self { Self { tx:0., ty:0., sx:1., sy:1., rotation:0., anchor_x:0.5, anchor_y:0.5 } } }
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct LayerMask { pub enabled: bool, pub inverted: bool, pub strokes: Vec<Stroke> }
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct LayerStyle { pub shadow: bool, pub shadow_color: [u8;4], pub shadow_blur: f32, pub shadow_x: f32, pub shadow_y: f32, pub outline: bool, pub outline_color: [u8;4], pub outline_width: f32 }
+impl Default for LayerStyle { fn default() -> Self { Self { shadow:false, shadow_color:[0,0,0,160], shadow_blur:0.015, shadow_x:0.02, shadow_y:0.02, outline:false, outline_color:[255;4], outline_width:0.005 } } }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Stroke {
@@ -30,7 +43,9 @@ pub struct Stroke {
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Op {
     /// Editable overlay layer; content is restricted to paint, shapes, gradient or text.
-    Layer { id: String, name: String, visible: bool, opacity: f32, blend: Blend, content: Box<Op> },
+    Layer { id: String, name: String, visible: bool, opacity: f32, blend: Blend, content: Box<Op>, #[serde(default)] transform: Transform, #[serde(default)] mask: Option<LayerMask>, #[serde(default)] style: LayerStyle },
+    Photo { asset_id: String, width: f32, height: f32 },
+    Adjustment { exposure: f32, brightness: f32, contrast: f32, saturation: f32, warmth: f32 },
     BaseOpacity { value: f32 },
     Text { text: String, x: f32, y: f32, size: f32, color: [u8; 4], bold: bool, align: TextAlign, leading: f32 },
     /// Normalized against the *source* dimensions, before any rotation.
@@ -250,6 +265,10 @@ fn is_geometry(op: &Op) -> bool {
 /// Applies ops in array order. The caller supplies them in a sensible order;
 /// the UI enforces geometry -> tone -> effects -> paint.
 pub fn apply_all(src: &RgbaImage, ops: &[Op]) -> RgbaImage {
+    apply_with_assets(src, ops, &std::collections::BTreeMap::new(), false)
+}
+
+pub fn apply_with_assets(src: &RgbaImage, ops: &[Op], assets: &std::collections::BTreeMap<String, crate::project::Asset>, full: bool) -> RgbaImage {
     // Brush radius is anchored to the image handed in here, so a stroke keeps
     // the same apparent thickness on a preview and on a full export, and does
     // not thicken when a later crop shrinks the frame.
@@ -259,16 +278,8 @@ pub fn apply_all(src: &RgbaImage, ops: &[Op]) -> RgbaImage {
     let mut geo: Vec<Op> = Vec::new();
     for op in ops {
         match op {
-            Op::Layer { visible, opacity, blend, content, .. } => {
-                if *visible && *opacity > 0.0 {
-                    let mut overlay = RgbaImage::new(img.width(), img.height());
-                    render_overlay(&mut overlay, content, &geo, src.dimensions(), base_short);
-                    for (dst, pixel) in img.pixels_mut().zip(overlay.pixels()) {
-                        if pixel[3] > 0 {
-                            blend_px(dst, [pixel[0] as f32 / 255.0, pixel[1] as f32 / 255.0, pixel[2] as f32 / 255.0], pixel[3] as f32 / 255.0 * opacity.clamp(0.0, 1.0), *blend);
-                        }
-                    }
-                }
+            Op::Layer { visible, opacity, .. } => {
+                if *visible && *opacity > 0.0 { composite::composite_layer(&mut img, op, &geo, src.dimensions(), assets, full); }
             }
             Op::Text { .. } => render_text(&mut img, op, &geo, src.dimensions(), base_short),
             Op::Paint { strokes } => paint(&mut img, strokes, &geo, base_short),
@@ -300,7 +311,7 @@ pub fn apply_all(src: &RgbaImage, ops: &[Op]) -> RgbaImage {
 
 fn apply_one(img: RgbaImage, op: &Op) -> RgbaImage {
     match *op {
-        Op::Layer { .. } | Op::Text { .. } => img,
+        Op::Layer { .. } | Op::Text { .. } | Op::Photo { .. } | Op::Adjustment { .. } => img,
         Op::BaseOpacity { value } => per_pixel(img, |c| [c[0], c[1], c[2], clamp8(c[3] as f32 * value.clamp(0.0, 1.0))]),
         Op::Crop { x, y, w, h } => crop_normalized(&img, x, y, w, h),
         Op::Rotate { turns } => match turns % 4 {
@@ -1274,7 +1285,7 @@ mod tests {
         Op::Text { text: "Hello\nDarkroom".into(), x: 0.15, y: 0.1, size: 0.15, color: [255, 0, 0, 255], bold: false, align: TextAlign::Left, leading: 1.2 }
     }
     fn overlay(content: Op, opacity: f32, visible: bool) -> Op {
-        Op::Layer { id: "test".into(), name: "Test".into(), visible, opacity, blend: Blend::Normal, content: Box::new(content) }
+        Op::Layer { id: "test".into(), name: "Test".into(), visible, opacity, blend: Blend::Normal, content: Box::new(content), transform: Transform::default(), mask: None, style: LayerStyle::default() }
     }
     #[test]
     fn text_layers_render_and_respect_visibility_opacity_and_order() {

@@ -73,7 +73,7 @@ impl Editor {
             )));
         }
         limits::check_image_bytes(name, bytes.len()).map_err(err)?;
-        let held: u64 = self.layers.iter().map(|l| l.source.len() as u64).sum();
+        let held: u64 = self.layers.iter().map(|l| l.bytes()).sum();
         if held + bytes.len() as u64 > MAX_SESSION_BYTES {
             return Err(err(format!(
                 "Opening '{name}' would hold more than {} of images in memory. Close some images first.",
@@ -94,6 +94,26 @@ impl Editor {
         self.layers.push(layer);
         self.touch(&id);
         Ok(id)
+    }
+
+    /// Keep original photo bytes for lossless project saves and full-resolution export.
+    pub fn add_photo_asset(&mut self, id: &str, asset_id: &str, bytes: &[u8]) -> Result<String, JsValue> {
+        if asset_id.is_empty() || asset_id.len() > 100 || self.layer(id)?.assets.contains_key(asset_id) { return Err(err("Invalid or duplicate photo asset ID.")); }
+        if self.layers.iter().map(|l| l.assets.len()).sum::<usize>() >= 64 { return Err(err("Up to 64 imported photo assets can be held in a session. Save and reopen to discard unused assets.")); }
+        limits::check_image_bytes("Photo layer", bytes.len()).map_err(err)?;
+        let held: u64 = self.layers.iter().map(Layer::bytes).sum();
+        if held + bytes.len() as u64 + 1024*1024*4 > MAX_SESSION_BYTES { return Err(err("Photo assets exceed the session memory budget.")); }
+        let asset = project::Asset::new(bytes.to_vec()).map_err(err)?;
+        let dims = asset.preview.dimensions();
+        self.layer_mut(id)?.assets.insert(asset_id.into(), asset);
+        Ok(serde_json::json!({ "width":dims.0, "height":dims.1 }).to_string())
+    }
+
+    pub fn overlay_bounds(&mut self, id: &str, layer_id: &str) -> Result<String, JsValue> {
+        let dims = self.layer_mut(id)?.dims().map_err(err)?;
+        let layer = self.layer(id)?;
+        let op = layer.ops.iter().find(|o| matches!(o, Op::Layer { id, .. } if id == layer_id)).ok_or_else(|| err("Select a layer first."))?;
+        Ok(serde_json::to_string(&ops::content_bounds(op, dims, &layer.assets)).unwrap())
     }
 
     pub fn remove_image(&mut self, id: &str) {
@@ -120,6 +140,7 @@ impl Editor {
         let parsed: Vec<Op> =
             serde_json::from_str(ops_json).map_err(|e| err(format!("Bad ops list: {e}")))?;
         limits::check_ops(&parsed).map_err(err)?;
+        self.layer(id)?.check_assets(&parsed).map_err(err)?;
         let layer = self.layer_mut(id)?;
         layer.ops = parsed;
         Ok(())
@@ -139,7 +160,7 @@ impl Editor {
                 "id": l.id, "name": l.name,
                 "width": w, "height": h,
                 "opCount": l.ops.len(),
-                "bytes": l.source.len(),
+                "bytes": l.bytes(),
             }));
         }
         serde_json::to_string(&out).map_err(|e| err(e.to_string()))
@@ -150,7 +171,7 @@ impl Editor {
     pub fn render_preview(&mut self, id: &str, max_dim: u32) -> Result<(), JsValue> {
         let base = self.scaled_source(id, max_dim)?.clone();
         let ops = self.layer(id)?.ops.clone();
-        self.preview = ops::apply_all(&base, &ops);
+        self.preview = ops::apply_with_assets(&base, &ops, &self.layer(id)?.assets, false);
         Ok(())
     }
 
@@ -169,7 +190,7 @@ impl Editor {
         let layer = self.layer_mut(id)?;
         let small = layer.thumb_source(max_dim).map_err(err)?.clone();
         let ops = layer.ops.clone();
-        encode_png(&ops::apply_all(&small, &ops)).map_err(err)
+        encode_png(&ops::apply_with_assets(&small, &ops, &layer.assets, false)).map_err(err)
     }
 
     /// Full-resolution render. `format` is "png", "jpeg" or "webp" (lossless).
@@ -178,7 +199,7 @@ impl Editor {
         let (tw, th) = self.scaled_dims(id, scale)?;
         let src = self.full(id)?.clone();
         let ops = self.layer(id)?.ops.clone();
-        let mut out = ops::apply_all(&src, &ops);
+        let mut out = ops::apply_with_assets(&src, &ops, &self.layer(id)?.assets, true);
         drop(src);
         if out.dimensions() != (tw, th) {
             out = image::imageops::resize(&out, tw, th, FilterType::Lanczos3);

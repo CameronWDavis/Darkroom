@@ -32,7 +32,7 @@ pub const MAX_SESSION_BYTES: u64 = 768 * MIB;
 pub const MAX_BUNDLE_BYTES: u64 = 800 * MIB;
 /// Entries in the zip's central directory. A real bundle has one per image
 /// plus the manifest; anything far beyond that is not one of ours.
-pub const MAX_BUNDLE_ENTRIES: usize = MAX_DOCUMENTS * 2 + 8;
+pub const MAX_BUNDLE_ENTRIES: usize = MAX_DOCUMENTS * 2 + 72;
 /// The manifest is JSON instructions. Long brush sessions are the bulk of it.
 pub const MAX_MANIFEST_BYTES: u64 = 16 * MIB;
 /// Sum of every inflated entry we read out of one bundle.
@@ -129,13 +129,22 @@ pub fn check_ops(ops: &[Op]) -> Result<(), String> {
     let mut flattened = Vec::new();
     let mut layer_count = 0;
     for op in ops {
-        if let Op::Layer { id, name, opacity, content, .. } = op {
+        if let Op::Layer { id, name, opacity, content, transform: t, mask, style, .. } = op {
             layer_count += 1;
             if id.len() > 100 || name.len() > 300 || !opacity.is_finite() || !(0.0..=1.0).contains(opacity) {
                 return Err("Invalid layer properties.".into());
             }
-            if !matches!(content.as_ref(), Op::Text { .. } | Op::Paint { .. } | Op::Shapes { .. } | Op::Gradient { .. }) {
+            if !matches!(content.as_ref(), Op::Text { .. } | Op::Paint { .. } | Op::Shapes { .. } | Op::Gradient { .. } | Op::Photo { .. } | Op::Adjustment { .. }) {
                 return Err("Layers can contain text, paint, shapes or gradients; nested layers are unsupported.".into());
+            }
+            let range = |v: f32, lo, hi| v.is_finite() && v >= lo && v <= hi;
+            if !range(t.tx,-2.,2.) || !range(t.ty,-2.,2.) || !range(t.sx,0.01,10.) || !range(t.sy,0.01,10.) || !range(t.rotation,-360.,360.) || !range(t.anchor_x,0.,1.) || !range(t.anchor_y,0.,1.) { return Err("Invalid layer transform.".into()); }
+            if !range(style.shadow_blur,0.,0.05) || !range(style.shadow_x,-0.5,0.5) || !range(style.shadow_y,-0.5,0.5) || !range(style.outline_width,0.,0.05) { return Err("Invalid layer style.".into()); }
+            if let Some(m) = mask {
+                strokes += m.strokes.len(); points += m.strokes.iter().map(|s| s.points.len()/2).sum::<usize>();
+                for s in &m.strokes {
+                    if !range(s.width,0.001,1.) || s.erase || s.points.len()%2 != 0 || s.points.iter().any(|v| !range(*v,0.,1.)) { return Err("Invalid mask stroke.".into()); }
+                }
             }
             flattened.push(content.as_ref());
         } else { flattened.push(op); }
@@ -144,6 +153,12 @@ pub fn check_ops(ops: &[Op]) -> Result<(), String> {
     let mut text_chars = 0;
     for op in flattened {
         match op {
+            Op::Photo { asset_id, width, height } => {
+                if asset_id.is_empty() || asset_id.len()>100 || !width.is_finite() || !height.is_finite() || !(0.001..=1.).contains(width) || !(0.001..=1.).contains(height) { return Err("Invalid photo layer.".into()); }
+            }
+            Op::Adjustment { exposure, brightness, contrast, saturation, warmth } => {
+                if [exposure,brightness,contrast,saturation,warmth].iter().any(|v| !v.is_finite() || v.abs()>1.) { return Err("Invalid adjustment layer.".into()); }
+            }
             Op::Text { text, x, y, size, leading, .. } => {
                 text_chars += text.chars().count();
                 if text.chars().count() > 1000 || text.lines().count() > 50 || !x.is_finite() || !y.is_finite()

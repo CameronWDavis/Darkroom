@@ -31,6 +31,8 @@
 </nav>
 <main id="image-workspace">
   <nav class="tool-rail" aria-label="Image tools">
+    <button class="btn" data-tool="transform" title="Move / transform layer (V)" aria-label="Transform">↖</button>
+    <button class="btn" data-tool="mask" title="Paint layer mask (M)" aria-label="Mask">◑</button>
     <button class="btn" data-tool="hand" title="Hand — pan the view (H, or hold Space)" aria-label="Hand">✋</button>
     <button class="btn" data-tool="crop" title="Crop (C)" aria-label="Crop">⌗</button>
     <button class="btn" data-tool="lasso" title="Lasso (L)" aria-label="Lasso">♧</button>
@@ -59,6 +61,8 @@
       <details class="group" id="layers-panel" open>
         <summary>Layers</summary>
         <div class="row-btns two"><button class="btn sm" id="layer-add-text">+ Text</button><button class="btn sm" id="layer-add-paint">+ Drawing</button></div>
+        <div class="row-btns two"><button class="btn sm" id="layer-add-photo">+ Photo</button><button class="btn sm" id="layer-add-adjustment">+ Adjustment</button></div>
+        <input type="file" id="file-layer-photo" accept="image/png,image/jpeg,image/webp,image/gif,image/bmp,image/tiff" hidden>
         <div id="art-layers" class="art-layers" aria-label="Layers, topmost first"></div>
         <label class="art-field">Name<input id="layer-name" maxlength="64"></label>
         <label class="slider"><span>Opacity</span><output id="layer-opacity-value">100%</output><input type="range" id="layer-opacity" min="0" max="100" value="100"></label>
@@ -73,7 +77,44 @@
           <label class="check"><input id="text-bold" type="checkbox">Bold</label>
           <p class="note">Lato · Drag on the canvas with Type (T) to move the selected text. Text stays editable when saved.</p>
         </div>
-        <p class="note">Layers composite above the adjusted photo. Shapes and gradients create new layers; the brush uses the selected drawing layer.</p>
+        <div id="layer-extra" hidden>
+          <details id="transform-properties" class="layer-section" open>
+            <summary>Transform</summary>
+            <div class="row-btns two"><button class="btn sm" id="layer-transform">Canvas handles (V)</button><button class="btn sm" id="transform-reset">Reset</button></div>
+            <div class="row-btns two"><label class="art-field">Move X (%)<input type="number" id="transform-tx" min="-200" max="200" step="1"></label><label class="art-field">Move Y (%)<input type="number" id="transform-ty" min="-200" max="200" step="1"></label></div>
+            <div class="row-btns two"><label class="art-field">Width (%)<input type="number" id="transform-sx" min="1" max="1000" step="1"></label><label class="art-field">Height (%)<input type="number" id="transform-sy" min="1" max="1000" step="1"></label></div>
+            <label class="art-field">Rotation (°)<input type="number" id="transform-rotation" min="-360" max="360" step="1"></label>
+            <label class="check"><input type="checkbox" id="transform-lock" checked>Keep proportions when dragging</label>
+            <p class="note">Drag to move, square corners to resize, or the round handle to rotate. Hold Shift to snap rotation to 15°.</p>
+          </details>
+          <details id="adjustment-properties" class="layer-section" open hidden>
+            <summary>Adjustment layer</summary>
+            <div id="adjustment-sliders"></div>
+            <p class="note">Affects the original and layers below it. Move this layer to change its scope; paint its mask to target an area.</p>
+          </details>
+          <details class="layer-section" open>
+            <summary>Mask</summary>
+            <button class="btn sm wide" id="mask-add">Add mask</button>
+            <div id="mask-properties" hidden>
+              <div class="row-btns two"><label class="check"><input type="checkbox" id="mask-enabled">Enabled</label><label class="check"><input type="checkbox" id="mask-inverted">Invert</label></div>
+              <div class="row-btns two"><button class="btn sm" id="mask-paint">Paint mask (M)</button><button class="btn sm" id="mask-remove">Remove mask</button></div>
+              <label class="art-field">Brush<select id="mask-mode"><option value="hide">Hide (black)</option><option value="reveal">Reveal (white)</option></select></label>
+              <label class="art-field">Brush size (% of short edge)<input type="number" id="mask-size" min="0.1" max="100" step="0.5" value="8"></label>
+              <label class="art-field">Brush opacity (%)<input type="number" id="mask-strength" min="1" max="100" value="100"></label>
+              <p class="note">Paint to hide or restore part of this layer. The original pixels are preserved; the mask moves with the layer.</p>
+            </div>
+          </details>
+          <details id="style-properties" class="layer-section">
+            <summary>Shadow &amp; outline</summary>
+            <label class="check"><input type="checkbox" id="style-shadow">Drop shadow</label>
+            <div class="row-btns two"><label class="art-field">Color<input type="color" id="style-shadow-color" value="#000000"></label><label class="art-field">Opacity (%)<input type="number" id="style-shadow-opacity" min="0" max="100"></label></div>
+            <label class="art-field">Blur (% of short edge)<input type="number" id="style-shadow-blur" min="0" max="5" step="0.1"></label>
+            <div class="row-btns two"><label class="art-field">Offset X (%)<input type="number" id="style-shadow-x" min="-50" max="50" step="0.1"></label><label class="art-field">Offset Y (%)<input type="number" id="style-shadow-y" min="-50" max="50" step="0.1"></label></div>
+            <label class="check"><input type="checkbox" id="style-outline">Outline</label>
+            <div class="row-btns two"><label class="art-field">Color<input type="color" id="style-outline-color" value="#ffffff"></label><label class="art-field">Width (% of short edge)<input type="number" id="style-outline-width" min="0" max="5" step="0.1"></label></div>
+          </details>
+        </div>
+        <p class="note">Topmost layers appear in front. Photo layers keep their original files. Save a project to preserve editable layers, masks, and effects.</p>
       </details>
 
       <details class="group" open>
@@ -432,6 +473,7 @@
 
 <dialog class="sheet wide-sheet" id="shortcuts-dialog">
   <h2>Keyboard shortcuts</h2>
+  <p><kbd>V</kbd> Layer transform · <kbd>M</kbd> Layer mask brush</p>
   <dl class="keys">
     <div><dt>H / hold Space</dt><dd>Hand — pan</dd></div>
     <div><dt>C</dt><dd>Crop</dd></div>

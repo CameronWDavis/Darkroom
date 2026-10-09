@@ -788,3 +788,10 @@ body.v-exporting .vtimeline { opacity:1; }
 .art-field input:not([type="color"]), .art-field textarea, .art-field select { width:100%; min-width:0; padding:6px; color:var(--text); background:var(--ink); border:1px solid var(--line); border-radius:3px; font:inherit; }
 .art-field textarea { resize:vertical; }
 #text-properties { border-top:1px solid var(--line); margin-top:14px; }
+
+/* Layer controls share the panel's existing compact form rhythm. */
+.layer-section { border-top: 1px solid var(--line, #35383d); padding: 10px 0; margin-top: 8px; }
+.layer-section > summary { cursor: pointer; font-size: 12px; font-weight: 600; margin-bottom: 10px; }
+.layer-section input[type=number] { min-width: 0; width: 100%; }
+.layer-section .check { margin: 8px 0; }
+.art-row button { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

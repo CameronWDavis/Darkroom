@@ -22,8 +22,13 @@ Edits are kept in memory during your session. Save or export your work before cl
 ## Image studio
 
 - Neutral dark workspace with a left tool rail, right properties panel with collapsible sections, and document filmstrip.
-- **Layers:** text, drawings, shapes, and gradients in an ordered stack above the photo, with visibility, naming, opacity, 11 blend modes, duplication, and deletion. Select a drawing layer before painting or erasing; new shapes and gradients get their own layers. The original photo stays at the bottom and can be made transparent with its opacity control.
+- **Layers:** imported photos, editable text, drawings, shapes, gradients, and adjustments in an ordered stack above the photo, with visibility, naming, opacity, 11 blend modes, duplication, and deletion. Select a drawing layer before painting or erasing; new shapes and gradients get their own layers. The original photo stays at the bottom and can be made transparent with its opacity control.
 - **Editable text:** multiline Lato text in regular or bold, color, size, alignment, line spacing, and position. Use **T** and drag on the canvas to move the selected text layer. Text renders at export resolution and remains editable in saved projects.
+- **Photo layers:** click **+ Photo** to place another image in the current document. Each photo retains its original bytes in saved projects; duplicates share the same asset.
+- **Transform handles (V):** drag the selected layer to move it, drag a corner to resize it, or use the round handle to rotate. Proportional resizing is on by default; Shift snaps rotation to 15°. Numeric controls provide precise placement and scaling.
+- **Layer masks (M):** add a mask, then paint black to hide or white to reveal. Brush size and opacity, invert, disable, and remove controls are nondestructive. Masks move with transformed layers.
+- **Adjustment layers:** brightness, contrast, exposure, saturation, and warmth affect the original and all layers below the adjustment. Reorder it to change its scope, lower its opacity to mix the result, or mask it to target an area.
+- **Layer styles:** adjustable drop shadows and colored outlines on photos, text, drawings, shapes, and gradients.
 - **Tools:** hand (pan), crop with aspect ratios, lasso cutouts, brush and paint eraser, gradient, shapes, and image color sampling.
 - **Basic:** brightness, contrast, exposure (±2 stops), saturation, and temperature.
 - **Levels:** input black/white points, midtone gamma, output range, and **Auto** levels.
@@ -34,9 +39,9 @@ Edits are kept in memory during your session. Save or export your work before cl
 - **Shape tool:** rectangles, ellipses, and lines with fill and stroke. Hold **Shift** for squares, circles, and 45° lines.
 - RGB and luminance histogram, a History panel you can click to jump to any step, zoom up to 800%, Ctrl+scroll zoom, Space-drag panning, and original comparison.
 - Undo/redo, nondestructive project saving, and full-resolution PNG, JPEG, or lossless WebP export, resized from 25% to 200%.
-- Shortcuts: **H** hand (or hold **Space**), **B** brush, **E** eraser, **G** gradient, **U** shapes, **C** crop, **L** lasso, **I** eyedropper, **[ ]** size, **\\** compare, **Escape** exit tool, **Ctrl/Cmd+Z** undo, **Ctrl/Cmd+Shift+Z** redo, **Ctrl/Cmd+= / − / 0** zoom, **Ctrl/Cmd+O / S** open/save project, **Ctrl/Cmd+Shift+E** export, **?** list all shortcuts.
+- Shortcuts: **V** transform, **M** mask brush, **T** text, **H** hand (or hold **Space**), **B** brush, **E** eraser, **G** gradient, **U** shapes, **C** crop, **L** lasso, **I** eyedropper, **[ ]** size, **\\** compare, **Escape** exit tool, **Ctrl/Cmd+Z** undo, **Ctrl/Cmd+Shift+Z** redo, **Ctrl/Cmd+= / − / 0** zoom, **Ctrl/Cmd+O / S** open/save project, **Ctrl/Cmd+Shift+E** export, **?** list all shortcuts.
 
-Gradients, shapes, and brushwork are stored in source-image coordinates, so they stay attached to the subject through later crops, rotations, and flips. The filmstrip switches between independent documents; the Layers panel manages the overlay stack within each document. Global color adjustments affect the photo beneath the layers. This release supports overlay layers, not groups, masks, additional photo layers, or PSD import/export. Text uses the bundled Lato fonts; complex-script shaping and emoji are not supported. The eraser removes brush marks from the selected drawing layer without removing the source photograph. Older projects open with their existing artwork migrated into layers; new projects use format v4 and require an updated Darkroom to reopen.
+Gradients, shapes, and brushwork are stored in source-image coordinates, so they stay attached to the subject through later crops, rotations, and flips. The filmstrip switches between independent documents; the Layers panel manages the overlay stack within each document. Global color adjustments affect the photo beneath the layers. Layer groups, clipping masks, perspective transforms, and PSD import/export are not implemented. Masks and styles are rasterized within the original document bounds before the layer transform; content or effects outside those bounds are clipped. Photo previews use cached images up to 1024 px; export decodes the originals. Text uses the bundled Lato fonts; complex-script shaping and emoji are not supported. The eraser removes brush marks from the selected drawing layer without removing the source photograph. Older projects open with their existing artwork migrated into layers; new projects use format v5 and require an updated Darkroom to reopen.
 
 ## Size limits
 
@@ -46,16 +51,19 @@ Everything is processed inside the browser tab, so Darkroom refuses files that w
 | --- | --- |
 | Image file | 100 MB |
 | Image dimensions | 16,384 px on the longest edge, 64 megapixels in total |
-| Open images | 32, holding up to 768 MB of original files |
-| Project (`.darkroom`) file | 800 MB, with at most 72 entries |
+| Open images | 32 documents; 768 MB of original files and cached photo-layer previews |
+| Project (`.darkroom`) file | 800 MB, with at most 136 entries |
 | Project contents once decompressed | 768 MB total, 16 MB manifest |
 | Compression ratio inside a project | 100:1 for any entry over 1 MB (zip-bomb protection) |
 | Export | 16,384 px per edge and 64 megapixels after resizing |
+| Imported photo assets | 64 per session/project; original image limits apply |
 | Image overlay layers / text | 128 layers; 1,000 characters per text layer, 4,000 per image |
 | Video studio: video / audio / image file | 8 GB / 1 GB / 50 MB (images also 16,384 px and 64 MP) |
 | Video studio: media bin and timeline | 64 files, 500 timeline items, 200 markers |
 | Video project (`.json`) and captions (`.srt`) | 5 MB and 2 MB |
 | Video export | 20 minutes of output |
+
+Unused photo assets are retained in the current session so undo can restore removed layers. Saving includes only assets still referenced by layers, once per document; saving and reopening releases unused assets.
 
 Sizes declared inside a zip are never trusted on their own: each entry is read through a hard cap, and its real decompressed size and ratio are measured. Image headers are checked for dimensions before any pixels are decoded. Video project files are rebuilt field by field from known defaults, so unknown keys and out-of-range values never reach the editor. The limits live in [src/limits.rs](src/limits.rs) and [web/video/model.js](web/video/model.js).
 
@@ -144,4 +152,4 @@ for f in web/app.js web/video.js web/video/*.js; do node --input-type=module --c
 node --test tests/*.test.mjs
 ```
 
-For browser integration coverage, build the image engine, serve `web`, and run `node tests/image_layers.browser.cjs` with Playwright installed. The test covers text, drawing and shape layers, ordering, visibility, undo/redo, project reopening, and image export. Set `DARKROOM_URL` to test another preview URL.
+For browser integration coverage, build the image engine, serve `web`, and run `node tests/image_layers.browser.cjs` with Playwright installed. The test covers text, drawing and shape layers, ordering, visibility, undo/redo, project reopening, and image export. Run `node tests/photo_layers.browser.cjs` for photo imports, transform handles, mask painting, adjustment ordering, styles, project reopening, and export. Set `DARKROOM_URL` to test another preview URL.

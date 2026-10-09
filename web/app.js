@@ -91,9 +91,9 @@ function renderArtPanel() {
     visible.setAttribute("aria-label", `Show ${layer.name}`);
     visible.onchange = () => { edit("Layer visibility", () => layer.visible = visible.checked); syncControls(); };
     const select = document.createElement("button"); select.className = "btn sm";
-    select.textContent = `${layer.content.op === "text" ? "T" : "◇"}  ${layer.name}`;
+    select.textContent = `${({text:"T",photo:"▧",adjustment:"◐"})[layer.content.op] || "◇"}  ${layer.name}${layer.mask ? " ◑" : ""}`;
     select.setAttribute("aria-pressed", String(selectedArt === layer.id));
-    select.onclick = () => { leaveTools(); selectedArt = layer.id; renderArtPanel(); if (layer.content.op === "text") activateTool("text"); };
+    select.onclick = () => { leaveTools(); selectedArt = layer.id; renderArtPanel(); if (layer.content.op === "text") activateTool("text"); else if (layer.content.op !== "adjustment") activateTool("transform"); };
     row.append(visible, select); list.append(row);
   }
   const base = document.createElement("button"); base.className = "btn sm wide";
@@ -106,6 +106,7 @@ function renderArtPanel() {
   $("layer-blend").disabled = !layer; $("layer-blend").value = layer?.blend || "normal";
   for (const id of ["layer-up", "layer-down", "layer-duplicate", "layer-delete"]) $(id).disabled = !layer;
   if (layer) { $("layer-up").disabled = a.artLayers.indexOf(layer) === a.artLayers.length-1; $("layer-down").disabled = a.artLayers.indexOf(layer) === 0; }
+  renderLayerExtras(layer);
   $("text-properties").hidden = !text;
   if (text) {
     $("text-content").value = text.text; $("text-bold").checked = text.bold;
@@ -180,9 +181,195 @@ $("canvas").addEventListener("pointermove",e=>{
   if(!typeDrag)return;
   const r=$("canvas").getBoundingClientRect(), a=adjust.get(activeId);
   const [x,y]=screenToSource((e.clientX-r.left)/r.width,(e.clientY-r.top)/r.height,a);
-  updateText(t=>{t.x=clamp(typeDrag.startX+x-typeDrag.x,0,1);t.y=clamp(typeDrag.startY+y-typeDrag.y,0,1);}); scheduleRender();
+  const l=selectedArtLayer(), p=layerLocal(x,y,l?.transform), q=layerLocal(typeDrag.x,typeDrag.y,l?.transform);
+  updateText(t=>{t.x=clamp(typeDrag.startX+p[0]-q[0],0,1);t.y=clamp(typeDrag.startY+p[1]-q[1],0,1);}); scheduleRender();
 });
 for(const event of ["pointerup","pointercancel"]) $("canvas").addEventListener(event,()=>{ if(typeDrag){typeDrag=null;syncControls();requestAnimationFrame(refreshLayers);} });
+
+// --- editable photo layers, transforms, masks and layer effects ------------
+const identityTransform = () => ({tx:0,ty:0,sx:1,sy:1,rotation:0,anchor_x:.5,anchor_y:.5});
+const defaultStyle = () => ({shadow:false,shadow_color:[0,0,0,160],shadow_blur:.015,shadow_x:.02,shadow_y:.02,outline:false,outline_color:[255,255,255,255],outline_width:.005});
+const adjustmentKeys = ['exposure','brightness','contrast','saturation','warmth'];
+let layerTool = null, layerDrag = null, maskStroke = null, maskCursor = null;
+const boundsCache = new Map();
+function layerBounds(l) {
+  const key=JSON.stringify([layerDimensions(),l.content]), old=boundsCache.get(l.id);
+  if(old?.key===key) return old.bounds;
+  ed.set_ops(activeId,JSON.stringify(buildOps(adjust.get(activeId))));
+  const bounds=JSON.parse(ed.overlay_bounds(activeId,l.id));
+  if(boundsCache.size>256)boundsCache.clear();
+  boundsCache.set(l.id,{key,bounds});return bounds;
+}
+function transformFor(l) {
+  if(!l.transform || (l.transform.sx===1 && l.transform.sy===1 && l.transform.rotation===0)) {
+    const [x,y,w,h]=layerBounds(l);
+    l.transform={...(l.transform||identityTransform()),anchor_x:x+w/2,anchor_y:y+h/2};
+  }
+  return l.transform;
+}
+function layerDimensions() { const d=layers.find(l=>l.id===activeId); return [d?.width||1,d?.height||1]; }
+function layerLocal(x,y,t) {
+  if(!t)return [x,y];
+  const [w,h]=layerDimensions(), r=t.rotation*Math.PI/180, c=Math.cos(r),s=Math.sin(r);
+  const px=(x-t.anchor_x-t.tx)*w,py=(y-t.anchor_y-t.ty)*h;
+  return [(px*c+py*s)/t.sx/w+t.anchor_x,(-px*s+py*c)/t.sy/h+t.anchor_y];
+}
+function layerWorld(x,y,t) {
+  t=t||identityTransform();const [w,h]=layerDimensions(),r=t.rotation*Math.PI/180,c=Math.cos(r),s=Math.sin(r);
+  const px=(x-t.anchor_x)*w*t.sx,py=(y-t.anchor_y)*h*t.sy;
+  return [(px*c-py*s)/w+t.anchor_x+t.tx,(px*s+py*c)/h+t.anchor_y+t.ty];
+}
+function renderLayerExtras(l) {
+  $('layer-extra').hidden=!l;if(!l)return;
+  const adjustment=l.content.op==='adjustment';
+  $('transform-properties').hidden=adjustment;$('style-properties').hidden=adjustment;
+  $('adjustment-properties').hidden=!adjustment;$('layer-blend').disabled=adjustment;
+  const t=l.transform||identityTransform(), style=l.style||defaultStyle();
+  for(const key of ['tx','ty','sx','sy','rotation']) $('transform-'+key).value=+(t[key]*(key==='rotation'?1:100)).toFixed(2);
+  for(const key of adjustmentKeys) { const v=Math.round((l.content[key]||0)*100);$('adjust-'+key).value=v;$('adjust-'+key+'-value').textContent=v; }
+  $('mask-add').hidden=!!l.mask;$('mask-properties').hidden=!l.mask;
+  if(l.mask) {$('mask-enabled').checked=l.mask.enabled;$('mask-inverted').checked=l.mask.inverted;}
+  for(const k of ['shadow','outline']) {$('style-'+k).checked=style[k];$('style-'+k+'-color').value=rgbToHex(style[k+'_color'].slice(0,3));}
+  $('style-shadow-opacity').value=Math.round(style.shadow_color[3]/255*100);
+  for(const k of ['shadow_blur','shadow_x','shadow_y','outline_width']) $('style-'+k.replaceAll('_','-')).value=+(style[k]*100).toFixed(2);
+}
+for(const key of adjustmentKeys) {
+  const row=document.createElement('label');row.className='slider';
+  const label=document.createElement('span');label.textContent=key[0].toUpperCase()+key.slice(1);
+  const output=document.createElement('output');output.id='adjust-'+key+'-value';
+  const input=document.createElement('input');Object.assign(input,{id:'adjust-'+key,type:'range',min:-100,max:100,value:0});
+  row.append(label,output,input);$('adjustment-sliders').append(row);
+  propertyInput(input.id,e=>{const l=selectedArtLayer();if(l?.content.op==='adjustment'){l.content[key]=Number(e.value)/100;output.textContent=e.value;}});
+}
+$('layer-add-photo').onclick=()=>$('file-layer-photo').click();
+$('file-layer-photo').onchange=async e=>{
+  const file=e.target.files[0],id=activeId;e.target.value='';if(!file||!id)return;
+  if(adjust.get(id).artLayers.length>=128)return say('An image can hold up to 128 layers.',true);
+  if(file.size>LIMITS.maxImageBytes)return say('This photo exceeds the image size limit.',true);
+  try {
+    const bytes=new Uint8Array(await file.arrayBuffer());if(activeId!==id)return say('Select the intended document and import the photo again.');
+    const asset_id=crypto.randomUUID(),dims=JSON.parse(ed.add_photo_asset(id,asset_id,bytes));
+    const [w,h]=layerDimensions(), scale=Math.min(w*.8/dims.width,h*.8/dims.height);
+    edit('Add photo layer',a=>addArt(a,file.name.slice(0,64),{op:'photo',asset_id,width:Math.max(.001,dims.width*scale/w),height:Math.max(.001,dims.height*scale/h)}));
+    leaveTools();activateTool('transform');syncControls();
+  } catch(error){fail(error);}
+};
+$('layer-add-adjustment').onclick=()=>{
+  if(!activeId)return;if(adjust.get(activeId).artLayers.length>=128)return say('An image can hold up to 128 layers.',true);
+  leaveTools();edit('Add adjustment layer',a=>addArt(a,'Adjustment',{op:'adjustment',...Object.fromEntries(adjustmentKeys.map(k=>[k,0]))}));syncControls();
+};
+$('layer-transform').onclick=()=>activateTool('transform');
+$('transform-reset').onclick=()=>{const l=selectedArtLayer();if(l){edit('Reset transform',()=>delete l.transform);syncControls();}};
+for(const key of ['tx','ty','sx','sy','rotation']) propertyInput('transform-'+key,e=>{
+  const l=selectedArtLayer();if(!l)return;const t=transformFor(l),lo=Number(e.min),hi=Number(e.max);
+  t[key]=clamp(Number(e.value)||0,lo,hi)/(key==='rotation'?1:100);
+});
+$('mask-add').onclick=()=>{
+  const l=selectedArtLayer();if(!l)return;edit('Add layer mask',()=>l.mask={enabled:true,inverted:false,strokes:[]});syncControls();activateTool('mask');
+};
+$('mask-remove').onclick=()=>{const l=selectedArtLayer();if(!l)return;leaveTools();edit('Remove layer mask',()=>l.mask=null);syncControls();};
+$('mask-paint').onclick=()=>activateTool('mask');
+for(const k of ['enabled','inverted']) propertyInput('mask-'+k,e=>{const l=selectedArtLayer();if(l?.mask)l.mask[k]=e.checked;});
+for(const k of ['shadow','outline']) {
+  propertyInput('style-'+k,e=>{const l=selectedArtLayer();if(l)(l.style??=defaultStyle())[k]=e.checked;});
+  propertyInput('style-'+k+'-color',e=>{const l=selectedArtLayer();if(l){const s=l.style??=defaultStyle();s[k+'_color']=[...hexToRgb(e.value),s[k+'_color'][3]];}});
+}
+propertyInput('style-shadow-opacity',e=>{const l=selectedArtLayer();if(l)(l.style??=defaultStyle()).shadow_color[3]=Math.round(clamp(Number(e.value),0,100)/100*255);});
+for(const k of ['shadow_blur','shadow_x','shadow_y','outline_width'])propertyInput('style-'+k.replaceAll('_','-'),e=>{
+  const l=selectedArtLayer();if(l)(l.style??=defaultStyle())[k]=clamp(Number(e.value),Number(e.min),Number(e.max))/100;
+});
+function enterLayerTool(tool) {
+  const l=selectedArtLayer();if(!l)return say('Select a layer from the Layers panel first.');
+  if(tool==='transform'&&l.content.op==='adjustment')return say('Adjustment layers affect the layers below. Use a mask to target an area.');
+  if(tool==='mask'&&!l.mask)return say('Add a mask to this layer first.');
+  layerTool=tool;$('ink').hidden=false;requestAnimationFrame(drawLayerTool);
+}
+function handleGeometry(l) {
+  const [x,y,w,h]=layerBounds(l),a=adjust.get(activeId);
+  const corners=[[x,y],[x+w,y],[x+w,y+h],[x,y+h]].map(p=>sourceToInk(...layerWorld(...p,l.transform),a));
+  const center=corners.reduce((sum,p)=>[sum[0]+p[0]/4,sum[1]+p[1]/4],[0,0]);
+  const top=[(corners[0][0]+corners[1][0])/2,(corners[0][1]+corners[1][1])/2];
+  const dx=top[0]-center[0],dy=top[1]-center[1],len=Math.hypot(dx,dy)||1;
+  return {corners,center,top,rotate:[top[0]+dx/len*28,top[1]+dy/len*28]};
+}
+function drawLayerTool() {
+  if(!layerTool)return;const l=selectedArtLayer();if(!l){leaveTools();return;}
+  syncInk();const ink=$('ink'),ctx=ink.getContext('2d');ink.style.cursor=layerTool==='mask'?'crosshair':'move';
+  if(layerTool==='transform') {
+    const g=handleGeometry(l);ctx.strokeStyle='#77ceff';ctx.lineWidth=1.5;ctx.fillStyle='#15232d';
+    ctx.beginPath();g.corners.forEach((p,i)=>i?ctx.lineTo(...p):ctx.moveTo(...p));ctx.closePath();ctx.stroke();
+    ctx.beginPath();ctx.moveTo(...g.top);ctx.lineTo(...g.rotate);ctx.stroke();
+    for(const p of g.corners){ctx.fillRect(p[0]-5,p[1]-5,10,10);ctx.strokeRect(p[0]-5,p[1]-5,10,10);}
+    ctx.beginPath();ctx.arc(...g.rotate,6,0,Math.PI*2);ctx.fill();ctx.stroke();
+  } else if(maskStroke) {
+    ctx.strokeStyle='rgba(119,206,255,.7)';ctx.lineWidth=2;ctx.beginPath();
+    for(let i=0;i<maskStroke.points.length;i+=2){const p=sourceToInk(...layerWorld(maskStroke.points[i],maskStroke.points[i+1],l.content.op==='adjustment'?null:l.transform),adjust.get(activeId));i?ctx.lineTo(...p):ctx.moveTo(...p);}
+    ctx.stroke();
+  }
+  if(layerTool==='mask' && maskCursor) {
+    const t=l.content.op==='adjustment'?null:l.transform;
+    const scale=t?Math.sqrt(t.sx*t.sy):1;
+    const radius=clamp(Number($('mask-size').value),.1,100)/100*sourceShortOnScreen()*scale/2;
+    ctx.beginPath();ctx.arc(maskCursor[0],maskCursor[1],Math.max(2,radius),0,Math.PI*2);
+    ctx.strokeStyle='#fff';ctx.lineWidth=1.5;ctx.stroke();ctx.strokeStyle='#111';ctx.lineWidth=.5;ctx.stroke();
+  }
+}
+function layerPointer(e) {const r=$('ink').getBoundingClientRect();return screenToSource((e.clientX-r.left)/r.width,(e.clientY-r.top)/r.height,adjust.get(activeId));}
+function maskPoint(e) {
+  const l=selectedArtLayer();const p=layerLocal(...layerPointer(e),l.content.op==='adjustment'?null:l.transform).map(v=>clamp(v,0,1));
+  const a=maskStroke.points;
+  if(a.length>=20000)return;
+  if(a.length && Math.hypot(p[0]-a[a.length-2],p[1]-a[a.length-1])<.002)return;
+  a.push(...p);
+}
+$('ink').addEventListener('pointerdown',e=>{
+  if(!layerTool||panning()||e.button!==0)return;
+  const l=selectedArtLayer();if(!l?.visible)return say('Show this layer before editing it.');
+  if(layerTool==='mask') {
+    if(!l.mask?.enabled)return say('Enable this mask before painting.');
+    const hide=$('mask-mode').value==='hide',color=hide?0:255;
+    // Inverted masks still honor the requested Hide / Reveal action.
+    const value=l.mask.inverted?255-color:color;
+    maskStroke={color:[value,value,value,Math.round(clamp(Number($('mask-strength').value),1,100)/100*255)],width:clamp(Number($('mask-size').value),.1,100)/100,erase:false,points:[]};maskPoint(e);
+  } else {
+    const r=$('ink').getBoundingClientRect(),p=[e.clientX-r.left,e.clientY-r.top],g=handleGeometry(l);
+    const corner=g.corners.findIndex(q=>Math.hypot(q[0]-p[0],q[1]-p[1])<14);
+    const mode=Math.hypot(g.rotate[0]-p[0],g.rotate[1]-p[1])<14?'rotate':corner>=0?'scale':'move';
+    pushHistory('Transform layer');const t=structuredClone(transformFor(l));
+    layerDrag={mode,t,start:layerPointer(e),local:layerLocal(...layerPointer(e),t)};
+  }
+  $('ink').setPointerCapture(e.pointerId);e.preventDefault();drawLayerTool();
+});
+$('ink').addEventListener('pointermove',e=>{
+  if(!layerTool)return;
+  if(layerTool==='mask'){const r=$('ink').getBoundingClientRect();maskCursor=[e.clientX-r.left,e.clientY-r.top];if(maskStroke)maskPoint(e);drawLayerTool();return;}
+  if(!layerDrag)return;
+  const l=selectedArtLayer(),d=layerDrag,p=layerPointer(e),t=l.transform,base=d.t;
+  if(d.mode==='move') {t.tx=clamp(base.tx+p[0]-d.start[0],-2,2);t.ty=clamp(base.ty+p[1]-d.start[1],-2,2);}
+  else if(d.mode==='rotate') {
+    const [w,h]=layerDimensions(),cx=base.anchor_x+base.tx,cy=base.anchor_y+base.ty;
+    const delta=(Math.atan2((p[1]-cy)*h,(p[0]-cx)*w)-Math.atan2((d.start[1]-cy)*h,(d.start[0]-cx)*w))*180/Math.PI;
+    let angle=((base.rotation+delta+540)%360)-180;if(e.shiftKey)angle=Math.round(angle/15)*15;t.rotation=angle;
+  } else {
+    const q=layerLocal(...p,base),dx=d.local[0]-base.anchor_x,dy=d.local[1]-base.anchor_y;
+    let sx=Math.abs(dx)>.00001?(q[0]-base.anchor_x)/dx:1,sy=Math.abs(dy)>.00001?(q[1]-base.anchor_y)/dy:1;
+    if($('transform-lock').checked) {const [w,h]=layerDimensions();const ux=dx*w,uy=dy*h;const f=(ux*(q[0]-base.anchor_x)*w+uy*(q[1]-base.anchor_y)*h)/(ux*ux+uy*uy||1);sx=sy=f;}
+    t.sx=clamp(base.sx*sx,.01,10);t.sy=clamp(base.sy*sy,.01,10);
+  }
+  scheduleRender();
+});
+$('ink').addEventListener('pointerleave',()=>{maskCursor=null;if(layerTool==='mask')drawLayerTool();});
+for(const event of ['pointerup','pointercancel'])$('ink').addEventListener(event,()=>{
+  if(maskStroke) {
+    const stroke=maskStroke;maskStroke=null;const l=selectedArtLayer();
+    if(event!=='pointercancel'&&l?.mask) {
+      const candidate=structuredClone(adjust.get(activeId));candidate.artLayers.find(x=>x.id===l.id).mask.strokes.push(stroke);
+      try {ed.set_ops(activeId,JSON.stringify(buildOps(candidate)));edit('Paint layer mask',()=>l.mask.strokes.push(stroke));} catch(error){fail(error);}
+    }
+    scheduleRender();syncControls();requestAnimationFrame(refreshLayers);
+  }
+  if(layerDrag){if(event==='pointercancel'){const l=selectedArtLayer();if(l)l.transform=layerDrag.t;}layerDrag=null;scheduleRender();syncControls();requestAnimationFrame(refreshLayers);}
+});
 
 // --- ops translation -------------------------------------------------------
 // Canonical order is geometry, then tone, then colour, then effects, then
@@ -428,6 +615,7 @@ function draw() {
   $("document-info").textContent = `${layers.find(l => l.id === activeId)?.name || "Image"} · Preview ${w} × ${h}`;
   if (cropping) requestAnimationFrame(paintCrop);
   if (painting || drawTool) requestAnimationFrame(syncInk);
+  if (layerTool) requestAnimationFrame(drawLayerTool);
   if (lassoing) requestAnimationFrame(() => { syncInk(); drawLasso(); });
 }
 
@@ -1493,8 +1681,8 @@ $("hex").addEventListener("change", (e) => {
     const ink = $("ink"), r = ink.getBoundingClientRect();
     const nx = (e.clientX - r.left) / r.width;
     const ny = (e.clientY - r.top) / r.height;
-    const [sx, sy] = screenToSource(nx, ny, a);
-    inkStroke.points.push(sx, sy);
+    const [sx, sy] = layerLocal(...screenToSource(nx, ny, a), selectedArtLayer()?.content.op === "paint" ? selectedArtLayer()?.transform : null);
+    inkStroke.points.push(clamp(sx,0,1), clamp(sy,0,1));
   }
 
   /** Immediate feedback on a plain 2D context. The authoritative render still
@@ -1922,6 +2110,7 @@ const ZOOMS = [...$("view-zoom").options].map((o) => Number(o.value));
 function onZoom() {
   applyZoom();
   if (cropping) paintCrop();
+  if (layerTool) drawLayerTool();
   if (painting || lassoing || drawTool) { syncInk(); if (lassoing) drawLasso(); }
 }
 
@@ -2036,7 +2225,7 @@ document.addEventListener("keydown", (e) => {
     return;
   }
 
-  const tool = { t: "text", h: "hand", b: "paint", c: "crop", l: "lasso", e: "eraser", g: "gradient", u: "shape", i: "eyedropper" }[k];
+  const tool = { v: "transform", m: "mask", t: "text", h: "hand", b: "paint", c: "crop", l: "lasso", e: "eraser", g: "gradient", u: "shape", i: "eyedropper" }[k];
   if (tool) { e.preventDefault(); activateTool(tool); }
 });
 
@@ -2066,6 +2255,7 @@ function fail(e) {
 window.addEventListener("resize", () => {
   if (activeId) scheduleRender();
   if (cropping) paintCrop();
+  if (layerTool) drawLayerTool();
   if (painting || drawTool) syncInk();
   if (lassoing) { syncInk(); drawLasso(); }
 });
@@ -2084,6 +2274,7 @@ function leaveTools() {
   sampling = false;
   textTool = false;
   typeDrag = null;
+  if (layerTool) { layerTool = null; layerDrag = null; maskStroke = null; maskCursor = null; $("ink").hidden = true; }
   propertyGesture = null;
   handTool = false;
   $("canvas").style.cursor = "";
@@ -2091,6 +2282,7 @@ function leaveTools() {
 }
 
 function currentTool() {
+  if (layerTool) return layerTool;
   if (textTool) return "text";
   if (cropping) return "crop";
   if (lassoing) return "lasso";
@@ -2101,7 +2293,7 @@ function currentTool() {
   return null;
 }
 
-const TOOL_NAMES = { text: "Type — drag to position", crop: "Crop", lasso: "Scissors", paint: "Brush", eraser: "Eraser", gradient: "Gradient", shape: "Shapes", hand: "Hand", eyedropper: "Eyedropper" };
+const TOOL_NAMES = { transform: "Transform layer", mask: "Mask brush", text: "Type — drag to position", crop: "Crop", lasso: "Scissors", paint: "Brush", eraser: "Eraser", gradient: "Gradient", shape: "Shapes", hand: "Hand", eyedropper: "Eyedropper" };
 
 function updateToolUI() {
   const t = currentTool();
@@ -2121,6 +2313,7 @@ function activateTool(tool) {
   scheduleRender();
   // Choosing the active tool again puts it down, like the panel buttons do.
   if (same) return;
+  if (tool === "transform" || tool === "mask") enterLayerTool(tool);
   if (tool === "crop") enterCrop();
   if (tool === "lasso") enterLasso();
   if (tool === "paint" || tool === "eraser") {
