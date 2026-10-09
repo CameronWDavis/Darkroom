@@ -56,6 +56,121 @@ pub enum Op {
     /// outside the shape, so this is the one op that can introduce
     /// transparency into an otherwise opaque photograph.
     Lasso { points: Vec<f32> },
+
+    // --- v3 ---------------------------------------------------------------
+    /// Photoshop's Levels. Input and output points are 0..1; `gamma` is the
+    /// midtone exponent, where 1.0 is neutral and larger values brighten.
+    Levels { in_black: f32, in_white: f32, gamma: f32, out_black: f32, out_white: f32 },
+    /// Tone curves as flat x,y control points in 0..1, endpoints included.
+    /// `rgb` runs first, then each channel's own curve. An empty or two-point
+    /// identity list leaves that channel alone.
+    Curves {
+        #[serde(default)]
+        rgb: Vec<f32>,
+        #[serde(default)]
+        red: Vec<f32>,
+        #[serde(default)]
+        green: Vec<f32>,
+        #[serde(default)]
+        blue: Vec<f32>,
+    },
+    /// Rotates hue, in degrees, -180..180.
+    Hue { degrees: f32 },
+    /// -1.0 .. 1.0. Saturation that favours muted colours and leaves already
+    /// vivid ones (often skin) mostly alone.
+    Vibrance { value: f32 },
+    /// -1.0 .. 1.0 each. Positive shadows opens dark regions; positive
+    /// highlights recovers bright ones. Driven by a blurred luminance mask, so
+    /// it works on regions rather than flattening global contrast.
+    ShadowsHighlights { shadows: f32, highlights: f32 },
+    /// Luminosity-preserving colour tint, like a filter on a lens. Density 0..1.
+    PhotoFilter { color: [u8; 3], density: f32 },
+    /// -1.0 .. 1.0. Negative darkens the corners, positive lightens them.
+    Vignette { amount: f32 },
+    /// Film grain, 0..1. `mono` adds the same noise to every channel.
+    Noise {
+        amount: f32,
+        #[serde(default)]
+        mono: bool,
+    },
+    /// Tonal levels per channel, 2..=64.
+    Posterize { levels: u8 },
+    /// Pure black and white split at this luminance, 0..1.
+    Threshold { level: f32 },
+    /// Mosaic cell edge, 0..1, mapping to up to 10% of the short edge.
+    Pixelate { size: f32 },
+    /// A colour ramp laid over the frame. Endpoints are normalized *source*
+    /// coordinates, like paint, so the ramp stays put under a later crop.
+    Gradient {
+        kind: GradientKind,
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        from: [u8; 4],
+        to: [u8; 4],
+        #[serde(default = "one")]
+        opacity: f32,
+        #[serde(default)]
+        blend: Blend,
+    },
+    /// Vector shapes, rendered resolution-independently in source space.
+    Shapes { items: Vec<Shape> },
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum GradientKind {
+    Linear,
+    Radial,
+}
+
+/// The separable blend modes from the W3C compositing spec, which match
+/// Photoshop's for 8-bit RGB.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Blend {
+    #[default]
+    Normal,
+    Multiply,
+    Screen,
+    Overlay,
+    SoftLight,
+    HardLight,
+    Darken,
+    Lighten,
+    Difference,
+    ColorDodge,
+    ColorBurn,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ShapeKind {
+    Rect,
+    Ellipse,
+    Line,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Shape {
+    pub kind: ShapeKind,
+    /// Opposite corners (or line endpoints) in normalized source coordinates.
+    pub x0: f32,
+    pub y0: f32,
+    pub x1: f32,
+    pub y1: f32,
+    #[serde(default)]
+    pub fill: Option<[u8; 4]>,
+    #[serde(default)]
+    pub stroke: Option<[u8; 4]>,
+    /// Stroke width as a fraction of the source short edge, like a brush.
+    #[serde(default)]
+    pub width: f32,
+}
+
+fn one() -> f32 {
+    1.0
 }
 
 fn is_geometry(op: &Op) -> bool {
@@ -75,6 +190,10 @@ pub fn apply_all(src: &RgbaImage, ops: &[Op]) -> RgbaImage {
     for op in ops {
         match op {
             Op::Paint { strokes } => paint(&mut img, strokes, &geo, base_short),
+            Op::Gradient { kind, x0, y0, x1, y1, from, to, opacity, blend } => {
+                gradient(&mut img, *kind, (*x0, *y0), (*x1, *y1), *from, *to, *opacity, *blend, &geo)
+            }
+            Op::Shapes { items } => shapes(&mut img, items, &geo, base_short),
             Op::Lasso { points } => {
                 // A lasso shifts the frame just as a crop does, so anything
                 // applied afterwards has to be mapped through it. Recording
@@ -174,8 +293,529 @@ fn apply_one(img: RgbaImage, op: &Op) -> RgbaImage {
                 imageops::blur(&img, sigma)
             }
         }
-        // Both handled in apply_all, which has the geometry context they need.
-        Op::Paint { .. } | Op::Lasso { .. } => img,
+        Op::Levels { in_black, in_white, gamma, out_black, out_white } => {
+            let lut = levels_lut(in_black, in_white, gamma, out_black, out_white);
+            apply_luts(img, &lut, &lut, &lut)
+        }
+        Op::Curves { ref rgb, ref red, ref green, ref blue } => {
+            let master = curve_lut(rgb);
+            let chan = |pts: &[f32]| {
+                let own = curve_lut(pts);
+                let mut out = [0u8; 256];
+                for (i, o) in out.iter_mut().enumerate() {
+                    *o = own[master[i] as usize];
+                }
+                out
+            };
+            apply_luts(img, &chan(red), &chan(green), &chan(blue))
+        }
+        Op::Hue { degrees } => {
+            let shift = degrees.clamp(-180.0, 180.0);
+            if shift == 0.0 {
+                return img;
+            }
+            per_pixel(img, |c| {
+                let (h, s, v) = rgb_to_hsv(c[0], c[1], c[2]);
+                let [r, g, b] = hsv_to_rgb((h + shift).rem_euclid(360.0), s, v);
+                [r, g, b, c[3]]
+            })
+        }
+        Op::Vibrance { value } => {
+            let v = value.clamp(-1.0, 1.0);
+            per_pixel(img, |c| {
+                let mx = c[0].max(c[1]).max(c[2]) as f32;
+                let mn = c[0].min(c[1]).min(c[2]) as f32;
+                let sat = if mx > 0.0 { (mx - mn) / mx } else { 0.0 };
+                // Muted colours get the full push, saturated ones very little.
+                let f = 1.0 + v * (1.0 - sat).powi(2) * 1.5;
+                let l = luma(c);
+                [
+                    clamp8(l + (c[0] as f32 - l) * f),
+                    clamp8(l + (c[1] as f32 - l) * f),
+                    clamp8(l + (c[2] as f32 - l) * f),
+                    c[3],
+                ]
+            })
+        }
+        Op::ShadowsHighlights { shadows, highlights } => {
+            shadows_highlights(img, shadows.clamp(-1.0, 1.0), highlights.clamp(-1.0, 1.0))
+        }
+        Op::PhotoFilter { color, density } => {
+            let d = density.clamp(0.0, 1.0);
+            let tint = [color[0] as f32 / 255.0, color[1] as f32 / 255.0, color[2] as f32 / 255.0];
+            per_pixel(img, |c| {
+                let l = luma(c);
+                // Multiply through the filter colour, then put the original
+                // luminance back so the image is tinted, not darkened.
+                let m: Vec<f32> = (0..3).map(|i| c[i] as f32 * (1.0 - d + d * tint[i] * 1.6)).collect();
+                let ml = 0.2126 * m[0] + 0.7152 * m[1] + 0.0722 * m[2];
+                let k = l - ml;
+                [clamp8(m[0] + k), clamp8(m[1] + k), clamp8(m[2] + k), c[3]]
+            })
+        }
+        Op::Vignette { amount } => vignette(img, amount.clamp(-1.0, 1.0)),
+        Op::Noise { amount, mono } => {
+            let a = amount.clamp(0.0, 1.0) * 80.0;
+            if a <= 0.0 {
+                return img;
+            }
+            let mut img = img;
+            for (x, y, p) in img.enumerate_pixels_mut() {
+                let n0 = hash_noise(x, y, 0);
+                let (n1, n2) = if mono { (n0, n0) } else { (hash_noise(x, y, 1), hash_noise(x, y, 2)) };
+                p[0] = clamp8(p[0] as f32 + n0 * a);
+                p[1] = clamp8(p[1] as f32 + n1 * a);
+                p[2] = clamp8(p[2] as f32 + n2 * a);
+            }
+            img
+        }
+        Op::Posterize { levels } => {
+            let n = levels.clamp(2, 64) as f32 - 1.0;
+            let mut lut = [0u8; 256];
+            for (i, o) in lut.iter_mut().enumerate() {
+                *o = clamp8(((i as f32 / 255.0) * n).round() / n * 255.0);
+            }
+            apply_luts(img, &lut, &lut, &lut)
+        }
+        Op::Threshold { level } => {
+            let cut = level.clamp(0.0, 1.0) * 255.0;
+            per_pixel(img, |c| {
+                let v = if luma(c) >= cut { 255 } else { 0 };
+                [v, v, v, c[3]]
+            })
+        }
+        Op::Pixelate { size } => {
+            let short = img.width().min(img.height()) as f32;
+            let cell = (size.clamp(0.0, 1.0) * short * 0.1).round() as u32;
+            if cell < 2 {
+                img
+            } else {
+                pixelate(img, cell)
+            }
+        }
+        // All handled in apply_all, which has the geometry context they need.
+        Op::Paint { .. } | Op::Lasso { .. } | Op::Gradient { .. } | Op::Shapes { .. } => img,
+    }
+}
+
+// --- tone ------------------------------------------------------------------
+
+fn levels_lut(in_black: f32, in_white: f32, gamma: f32, out_black: f32, out_white: f32) -> [u8; 256] {
+    let ib = in_black.clamp(0.0, 1.0);
+    let iw = in_white.clamp(0.0, 1.0).max(ib + 1.0 / 255.0);
+    let inv_gamma = 1.0 / gamma.clamp(0.1, 9.99);
+    let (ob, ow) = (out_black.clamp(0.0, 1.0), out_white.clamp(0.0, 1.0));
+    let mut lut = [0u8; 256];
+    for (i, o) in lut.iter_mut().enumerate() {
+        let t = ((i as f32 / 255.0 - ib) / (iw - ib)).clamp(0.0, 1.0).powf(inv_gamma);
+        *o = clamp8((ob + t * (ow - ob)) * 255.0 + 0.5);
+    }
+    lut
+}
+
+/// A 256-entry table through the control points, using monotone cubic
+/// (Fritsch–Carlson) interpolation. Monotone matters: a plain spline
+/// overshoots between close points and folds the tone curve back on itself.
+pub fn curve_lut(flat: &[f32]) -> [u8; 256] {
+    let mut identity = [0u8; 256];
+    for (i, o) in identity.iter_mut().enumerate() {
+        *o = i as u8;
+    }
+    let mut pts: Vec<(f32, f32)> = flat
+        .chunks_exact(2)
+        .map(|c| (c[0].clamp(0.0, 1.0), c[1].clamp(0.0, 1.0)))
+        .collect();
+    pts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    pts.dedup_by(|a, b| (a.0 - b.0).abs() < 1e-4);
+    if pts.len() < 2 {
+        return identity;
+    }
+
+    let n = pts.len();
+    let d: Vec<f32> = (0..n - 1)
+        .map(|i| (pts[i + 1].1 - pts[i].1) / (pts[i + 1].0 - pts[i].0))
+        .collect();
+    let mut m = vec![0.0f32; n];
+    m[0] = d[0];
+    m[n - 1] = d[n - 2];
+    for i in 1..n - 1 {
+        m[i] = if d[i - 1] * d[i] <= 0.0 { 0.0 } else { (d[i - 1] + d[i]) / 2.0 };
+    }
+    for i in 0..n - 1 {
+        if d[i] == 0.0 {
+            m[i] = 0.0;
+            m[i + 1] = 0.0;
+            continue;
+        }
+        let (a, b) = (m[i] / d[i], m[i + 1] / d[i]);
+        let s = a * a + b * b;
+        if s > 9.0 {
+            let t = 3.0 / s.sqrt();
+            m[i] = t * a * d[i];
+            m[i + 1] = t * b * d[i];
+        }
+    }
+
+    let mut lut = [0u8; 256];
+    for (i, o) in lut.iter_mut().enumerate() {
+        let x = i as f32 / 255.0;
+        let y = if x <= pts[0].0 {
+            pts[0].1
+        } else if x >= pts[n - 1].0 {
+            pts[n - 1].1
+        } else {
+            let k = pts.windows(2).position(|w| x <= w[1].0).unwrap_or(n - 2);
+            let (p0, p1) = (pts[k], pts[k + 1]);
+            let h = p1.0 - p0.0;
+            let t = (x - p0.0) / h;
+            let (t2, t3) = (t * t, t * t * t);
+            (2.0 * t3 - 3.0 * t2 + 1.0) * p0.1
+                + (t3 - 2.0 * t2 + t) * h * m[k]
+                + (-2.0 * t3 + 3.0 * t2) * p1.1
+                + (t3 - t2) * h * m[k + 1]
+        };
+        *o = clamp8(y * 255.0 + 0.5);
+    }
+    lut
+}
+
+fn apply_luts(mut img: RgbaImage, r: &[u8; 256], g: &[u8; 256], b: &[u8; 256]) -> RgbaImage {
+    for p in img.pixels_mut() {
+        p[0] = r[p[0] as usize];
+        p[1] = g[p[1] as usize];
+        p[2] = b[p[2] as usize];
+    }
+    img
+}
+
+fn shadows_highlights(mut img: RgbaImage, shadows: f32, highlights: f32) -> RgbaImage {
+    if shadows == 0.0 && highlights == 0.0 {
+        return img;
+    }
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    let mut mask: Vec<f32> = img.pixels().map(|p| luma(p) / 255.0).collect();
+    // A wide radius is what makes this regional rather than a global curve.
+    let radius = ((w.min(h) as f32) * 0.03).round().max(1.0) as usize;
+    box_blur(&mut mask, w, h, radius);
+
+    for (p, &l) in img.pixels_mut().zip(mask.iter()) {
+        let ws = (1.0 - l).powi(2);
+        let wh = l * l;
+        for c in 0..3 {
+            let mut v = p[c] as f32 / 255.0;
+            if shadows > 0.0 {
+                v += shadows * ws * (1.0 - v) * 0.75;
+            } else {
+                v *= 1.0 + shadows * ws * 0.75;
+            }
+            if highlights > 0.0 {
+                v *= 1.0 - highlights * wh * 0.5;
+            } else {
+                v += -highlights * wh * (1.0 - v) * 0.75;
+            }
+            p[c] = clamp8(v * 255.0);
+        }
+    }
+    img
+}
+
+/// Three box passes approximate a Gaussian closely, at a cost independent of
+/// the radius. That independence is the point: a 3% radius on a 60 MP export
+/// would make a direct Gaussian crawl.
+fn box_blur(buf: &mut [f32], w: usize, h: usize, r: usize) {
+    if w == 0 || h == 0 || r == 0 {
+        return;
+    }
+    let mut tmp = vec![0.0f32; buf.len()];
+    for _ in 0..3 {
+        blur_line(buf, &mut tmp, w, h, r, true);
+        blur_line(&tmp, buf, w, h, r, false);
+    }
+}
+
+fn blur_line(src: &[f32], dst: &mut [f32], w: usize, h: usize, r: usize, horizontal: bool) {
+    let (lines, len) = if horizontal { (h, w) } else { (w, h) };
+    let at = |line: usize, i: usize| if horizontal { line * w + i } else { i * w + line };
+    let norm = 1.0 / (2 * r + 1) as f32;
+    for line in 0..lines {
+        // Clamp-to-edge so borders are not darkened by imaginary black.
+        let sample = |i: isize| src[at(line, i.clamp(0, len as isize - 1) as usize)];
+        let mut acc: f32 = (-(r as isize)..=r as isize).map(sample).sum();
+        for i in 0..len {
+            dst[at(line, i)] = acc * norm;
+            acc += sample(i as isize + r as isize + 1) - sample(i as isize - r as isize);
+        }
+    }
+}
+
+fn vignette(mut img: RgbaImage, amount: f32) -> RgbaImage {
+    if amount == 0.0 {
+        return img;
+    }
+    let (w, h) = (img.width() as f32, img.height() as f32);
+    for (x, y, p) in img.enumerate_pixels_mut() {
+        let dx = (x as f32 + 0.5) / w - 0.5;
+        let dy = (y as f32 + 0.5) / h - 0.5;
+        // 0 at the centre, 1 in the corners, elliptical to follow the frame.
+        let d = (dx * dx + dy * dy).sqrt() * std::f32::consts::SQRT_2;
+        let t = ((d - 0.3) / 0.7).clamp(0.0, 1.0);
+        let f = t * t * (3.0 - 2.0 * t);
+        for c in 0..3 {
+            let v = p[c] as f32;
+            p[c] = clamp8(if amount < 0.0 { v * (1.0 + amount * f) } else { v + amount * f * (255.0 - v) });
+        }
+    }
+    img
+}
+
+fn pixelate(mut img: RgbaImage, cell: u32) -> RgbaImage {
+    let (w, h) = img.dimensions();
+    for by in (0..h).step_by(cell as usize) {
+        for bx in (0..w).step_by(cell as usize) {
+            let (x1, y1) = ((bx + cell).min(w), (by + cell).min(h));
+            let mut sum = [0u64; 4];
+            for y in by..y1 {
+                for x in bx..x1 {
+                    let p = img.get_pixel(x, y);
+                    for c in 0..4 {
+                        sum[c] += p[c] as u64;
+                    }
+                }
+            }
+            let n = ((x1 - bx) * (y1 - by)) as u64;
+            let avg = Rgba([(sum[0] / n) as u8, (sum[1] / n) as u8, (sum[2] / n) as u8, (sum[3] / n) as u8]);
+            for y in by..y1 {
+                for x in bx..x1 {
+                    img.put_pixel(x, y, avg);
+                }
+            }
+        }
+    }
+    img
+}
+
+/// Stateless per-pixel noise in -1..1. Hashing the position instead of
+/// running an RNG means re-rendering the same frame gives the same grain, so
+/// a slider drag elsewhere doesn't make the image shimmer.
+fn hash_noise(x: u32, y: u32, channel: u32) -> f32 {
+    let mut h = x.wrapping_mul(0x8da6_b343) ^ y.wrapping_mul(0xd816_3841) ^ channel.wrapping_mul(0xcb1a_b31f);
+    h ^= h >> 13;
+    h = h.wrapping_mul(0x5bd1_e995);
+    h ^= h >> 15;
+    // Sum of two uniforms: a softer, more film-like distribution than flat.
+    let a = (h & 0xffff) as f32 / 65535.0;
+    let b = (h >> 16) as f32 / 65535.0;
+    a + b - 1.0
+}
+
+fn rgb_to_hsv(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
+    let (r, g, b) = (r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0);
+    let mx = r.max(g).max(b);
+    let mn = r.min(g).min(b);
+    let d = mx - mn;
+    let h = if d == 0.0 {
+        0.0
+    } else if mx == r {
+        60.0 * ((g - b) / d).rem_euclid(6.0)
+    } else if mx == g {
+        60.0 * ((b - r) / d + 2.0)
+    } else {
+        60.0 * ((r - g) / d + 4.0)
+    };
+    (h, if mx > 0.0 { d / mx } else { 0.0 }, mx)
+}
+
+fn hsv_to_rgb(h: f32, s: f32, v: f32) -> [u8; 3] {
+    let c = v * s;
+    let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
+    let m = v - c;
+    let (r, g, b) = match (h / 60.0) as u32 % 6 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    [clamp8((r + m) * 255.0 + 0.5), clamp8((g + m) * 255.0 + 0.5), clamp8((b + m) * 255.0 + 0.5)]
+}
+
+// --- compositing -----------------------------------------------------------
+
+fn blend_channel(mode: Blend, cb: f32, cs: f32) -> f32 {
+    match mode {
+        Blend::Normal => cs,
+        Blend::Multiply => cb * cs,
+        Blend::Screen => cb + cs - cb * cs,
+        Blend::Overlay => blend_channel(Blend::HardLight, cs, cb),
+        Blend::HardLight => {
+            if cs <= 0.5 {
+                cb * 2.0 * cs
+            } else {
+                let s = 2.0 * cs - 1.0;
+                cb + s - cb * s
+            }
+        }
+        Blend::SoftLight => {
+            if cs <= 0.5 {
+                cb - (1.0 - 2.0 * cs) * cb * (1.0 - cb)
+            } else {
+                let d = if cb <= 0.25 { ((16.0 * cb - 12.0) * cb + 4.0) * cb } else { cb.sqrt() };
+                cb + (2.0 * cs - 1.0) * (d - cb)
+            }
+        }
+        Blend::Darken => cb.min(cs),
+        Blend::Lighten => cb.max(cs),
+        Blend::Difference => (cb - cs).abs(),
+        Blend::ColorDodge => {
+            if cb == 0.0 {
+                0.0
+            } else if cs >= 1.0 {
+                1.0
+            } else {
+                (cb / (1.0 - cs)).min(1.0)
+            }
+        }
+        Blend::ColorBurn => {
+            if cb >= 1.0 {
+                1.0
+            } else if cs <= 0.0 {
+                0.0
+            } else {
+                1.0 - ((1.0 - cb) / cs).min(1.0)
+            }
+        }
+    }
+}
+
+/// Source-over with a blend mode, per the W3C formula: where the backdrop is
+/// transparent the source shows unblended, where it is opaque the blend wins.
+fn blend_px(dst: &mut Rgba<u8>, src: [f32; 3], sa: f32, mode: Blend) {
+    if sa <= 0.0 {
+        return;
+    }
+    let da = dst[3] as f32 / 255.0;
+    let out_a = sa + da * (1.0 - sa);
+    for c in 0..3 {
+        let cb = dst[c] as f32 / 255.0;
+        let cs = src[c];
+        let mixed = (1.0 - da) * cs + da * blend_channel(mode, cb, cs);
+        let v = (sa * mixed + (1.0 - sa) * da * cb) / out_a;
+        dst[c] = clamp8(v * 255.0 + 0.5);
+    }
+    dst[3] = clamp8(out_a * 255.0 + 0.5);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gradient(
+    img: &mut RgbaImage,
+    kind: GradientKind,
+    a: (f32, f32),
+    b: (f32, f32),
+    from: [u8; 4],
+    to: [u8; 4],
+    opacity: f32,
+    mode: Blend,
+    geo: &[Op],
+) {
+    let (w, h) = (img.width() as f32, img.height() as f32);
+    let (ax, ay) = map_point(a.0, a.1, geo);
+    let (bx, by) = map_point(b.0, b.1, geo);
+    let (ax, ay, bx, by) = (ax * w, ay * h, bx * w, by * h);
+    let (dx, dy) = (bx - ax, by - ay);
+    let len2 = dx * dx + dy * dy;
+    let opacity = opacity.clamp(0.0, 1.0);
+    if len2 < 1e-6 || opacity <= 0.0 {
+        return;
+    }
+    let len = len2.sqrt();
+    let f = |i: usize| (from[i] as f32 / 255.0, to[i] as f32 / 255.0);
+    for (x, y, p) in img.enumerate_pixels_mut() {
+        let (px, py) = (x as f32 + 0.5 - ax, y as f32 + 0.5 - ay);
+        let t = match kind {
+            GradientKind::Linear => (px * dx + py * dy) / len2,
+            GradientKind::Radial => (px * px + py * py).sqrt() / len,
+        }
+        .clamp(0.0, 1.0);
+        let lerp = |i: usize| {
+            let (s, e) = f(i);
+            s + (e - s) * t
+        };
+        let alpha = lerp(3);
+        // Interpolate colour premultiplied, so fading to transparent does not
+        // drag a dark fringe through the middle of the ramp.
+        let rgb = if alpha > 0.0 {
+            let pm = |i: usize| {
+                let (s, e) = f(i);
+                let (sa, ea) = f(3);
+                (s * sa + (e * ea - s * sa) * t) / alpha
+            };
+            [pm(0), pm(1), pm(2)]
+        } else {
+            [lerp(0), lerp(1), lerp(2)]
+        };
+        blend_px(p, rgb, alpha * opacity, mode);
+    }
+}
+
+fn shapes(img: &mut RgbaImage, items: &[Shape], geo: &[Op], base_short: f32) {
+    let (w, h) = (img.width() as f32, img.height() as f32);
+    for s in items {
+        let (ax, ay) = map_point(s.x0, s.y0, geo);
+        let (bx, by) = map_point(s.x1, s.y1, geo);
+        let (a, b) = ((ax * w, ay * h), (bx * w, by * h));
+        let hw = (s.width * base_short * 0.5).max(0.5);
+        let stroke = s.stroke.filter(|c| c[3] > 0 && s.width > 0.0);
+        let fill = s.fill.filter(|c| c[3] > 0 && s.kind != ShapeKind::Line);
+        if stroke.is_none() && fill.is_none() {
+            continue;
+        }
+
+        let (cx, cy) = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
+        let (rx, ry) = (((b.0 - a.0) / 2.0).abs(), ((b.1 - a.1) / 2.0).abs());
+        // Signed distance to the outline; negative inside.
+        let sdf = |px: f32, py: f32| -> f32 {
+            match s.kind {
+                ShapeKind::Rect => {
+                    let (qx, qy) = ((px - cx).abs() - rx, (py - cy).abs() - ry);
+                    let outside = (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt();
+                    outside + qx.max(qy).min(0.0)
+                }
+                ShapeKind::Ellipse => {
+                    // The usual first-order ellipse distance: exact on the
+                    // outline, which is all antialiasing needs.
+                    let (rx, ry) = (rx.max(0.5), ry.max(0.5));
+                    let (ux, uy) = ((px - cx) / rx, (py - cy) / ry);
+                    let k0 = (ux * ux + uy * uy).sqrt();
+                    let k1 = ((ux / rx).powi(2) + (uy / ry).powi(2)).sqrt();
+                    if k1 == 0.0 { -rx.min(ry) } else { k0 * (k0 - 1.0) / k1 }
+                }
+                ShapeKind::Line => dist_to_segment(px, py, a, b),
+            }
+        };
+
+        let pad = hw + 2.0;
+        let x0 = (a.0.min(b.0) - pad).floor().clamp(0.0, w) as u32;
+        let x1 = (a.0.max(b.0) + pad).ceil().clamp(0.0, w) as u32;
+        let y0 = (a.1.min(b.1) - pad).floor().clamp(0.0, h) as u32;
+        let y1 = (a.1.max(b.1) + pad).ceil().clamp(0.0, h) as u32;
+        let rgb = |c: [u8; 4]| [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0];
+
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let d = sdf(x as f32 + 0.5, y as f32 + 0.5);
+                let p = img.get_pixel_mut(x, y);
+                if let Some(c) = fill {
+                    let cov = (0.5 - d).clamp(0.0, 1.0);
+                    blend_px(p, rgb(c), cov * c[3] as f32 / 255.0, Blend::Normal);
+                }
+                if let Some(c) = stroke {
+                    let edge = if s.kind == ShapeKind::Line { d } else { d.abs() };
+                    let cov = (hw + 0.5 - edge).clamp(0.0, 1.0);
+                    blend_px(p, rgb(c), cov * c[3] as f32 / 255.0, Blend::Normal);
+                }
+            }
+        }
     }
 }
 
@@ -775,5 +1415,159 @@ mod tests {
         let out = apply_all(&white(200, 200), &ops);
         assert_eq!(out.dimensions(), (100, 100));
         assert_eq!(out.get_pixel(50, 50).0[2], 255, "the dot should be centred after the cut");
+    }
+
+    // --- v3 ops ------------------------------------------------------------
+
+    fn grey(v: u8) -> RgbaImage {
+        RgbaImage::from_pixel(8, 8, Rgba([v, v, v, 200]))
+    }
+
+    #[test]
+    fn neutral_levels_and_curves_change_nothing() {
+        let img = RgbaImage::from_fn(16, 16, |x, y| Rgba([(x * 16) as u8, (y * 16) as u8, 77, 255]));
+        let levels = Op::Levels { in_black: 0.0, in_white: 1.0, gamma: 1.0, out_black: 0.0, out_white: 1.0 };
+        assert_eq!(apply_all(&img, &[levels]), img);
+        let curves = Op::Curves { rgb: vec![0.0, 0.0, 1.0, 1.0], red: vec![], green: vec![], blue: vec![] };
+        assert_eq!(apply_all(&img, &[curves]), img);
+    }
+
+    #[test]
+    fn levels_stretch_the_input_range() {
+        let op = Op::Levels { in_black: 0.25, in_white: 0.75, gamma: 1.0, out_black: 0.0, out_white: 1.0 };
+        assert_eq!(apply_all(&grey(63), std::slice::from_ref(&op)).get_pixel(0, 0)[0], 0);
+        assert_eq!(apply_all(&grey(191), std::slice::from_ref(&op)).get_pixel(0, 0)[0], 255);
+        let mid = apply_all(&grey(128), &[op]).get_pixel(0, 0)[0];
+        assert!((126..=130).contains(&mid), "midpoint drifted to {mid}");
+        // Gamma above 1 brightens midtones, and alpha is never touched.
+        let bright = Op::Levels { in_black: 0.0, in_white: 1.0, gamma: 2.0, out_black: 0.0, out_white: 1.0 };
+        let p = *apply_all(&grey(128), &[bright]).get_pixel(0, 0);
+        assert!(p[0] > 160, "gamma 2 should lift mid-grey, got {}", p[0]);
+        assert_eq!(p[3], 200);
+    }
+
+    #[test]
+    fn curves_are_monotone_and_pass_through_their_points() {
+        let lut = curve_lut(&[0.0, 0.0, 0.25, 0.4, 0.5, 0.45, 1.0, 1.0]);
+        assert!(lut.windows(2).all(|w| w[0] <= w[1]), "curve folded back on itself");
+        assert!((lut[64] as i32 - 102).abs() <= 2, "should pass near (0.25, 0.4), got {}", lut[64]);
+        assert_eq!(lut[0], 0);
+        assert_eq!(lut[255], 255);
+        // A per-channel curve only touches its own channel.
+        let op = Op::Curves { rgb: vec![], red: vec![0.0, 1.0, 1.0, 1.0], green: vec![], blue: vec![] };
+        assert_eq!(apply_all(&grey(40), &[op]).get_pixel(0, 0).0, [255, 40, 40, 200]);
+    }
+
+    #[test]
+    fn hue_rotation_moves_red_to_green() {
+        let red = RgbaImage::from_pixel(2, 2, Rgba([255, 0, 0, 255]));
+        assert_eq!(apply_all(&red, &[Op::Hue { degrees: 120.0 }]).get_pixel(0, 0).0, [0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn threshold_and_posterize_quantize() {
+        let t = apply_all(&grey(100), &[Op::Threshold { level: 0.5 }]);
+        assert_eq!(t.get_pixel(0, 0).0, [0, 0, 0, 200]);
+        let t = apply_all(&grey(200), &[Op::Threshold { level: 0.5 }]);
+        assert_eq!(t.get_pixel(0, 0).0, [255, 255, 255, 200]);
+        let p = apply_all(&grey(100), &[Op::Posterize { levels: 2 }]);
+        assert_eq!(p.get_pixel(0, 0)[0], 0);
+    }
+
+    #[test]
+    fn vignette_darkens_corners_not_the_centre() {
+        let img = RgbaImage::from_pixel(101, 101, Rgba([200, 200, 200, 255]));
+        let out = apply_all(&img, &[Op::Vignette { amount: -1.0 }]);
+        assert_eq!(out.get_pixel(50, 50)[0], 200);
+        assert!(out.get_pixel(0, 0)[0] < 40);
+    }
+
+    #[test]
+    fn pixelate_makes_flat_cells() {
+        let img = RgbaImage::from_fn(100, 100, |x, y| Rgba([(x * 2) as u8, (y * 2) as u8, 0, 255]));
+        let out = apply_all(&img, &[Op::Pixelate { size: 1.0 }]);
+        assert_eq!(out.get_pixel(0, 0), out.get_pixel(9, 9), "a 10px cell should be uniform");
+        assert_ne!(out.get_pixel(0, 0), out.get_pixel(10, 0));
+    }
+
+    #[test]
+    fn noise_is_deterministic_and_keeps_alpha() {
+        let a = apply_all(&grey(128), &[Op::Noise { amount: 0.5, mono: false }]);
+        let b = apply_all(&grey(128), &[Op::Noise { amount: 0.5, mono: false }]);
+        assert_eq!(a, b);
+        assert_ne!(a, grey(128));
+        assert!(a.pixels().all(|p| p[3] == 200));
+    }
+
+    #[test]
+    fn shadows_lift_dark_regions_more_than_bright_ones() {
+        let mut img = RgbaImage::from_pixel(60, 30, Rgba([30, 30, 30, 255]));
+        for y in 0..30 { for x in 30..60 { img.put_pixel(x, y, Rgba([220, 220, 220, 255])); } }
+        let out = apply_all(&img, &[Op::ShadowsHighlights { shadows: 1.0, highlights: 0.0 }]);
+        let dark_gain = out.get_pixel(5, 15)[0] as i32 - 30;
+        let bright_gain = out.get_pixel(55, 15)[0] as i32 - 220;
+        assert!(dark_gain > 40, "shadows barely moved: +{dark_gain}");
+        assert!(bright_gain < 10, "highlights moved too much: +{bright_gain}");
+    }
+
+    #[test]
+    fn a_linear_gradient_ramps_across_the_frame() {
+        let op = Op::Gradient {
+            kind: GradientKind::Linear,
+            x0: 0.0, y0: 0.5, x1: 1.0, y1: 0.5,
+            from: [0, 0, 0, 255], to: [255, 255, 255, 255],
+            opacity: 1.0, blend: Blend::Normal,
+        };
+        let out = apply_all(&grey(0), &[op]);
+        assert!(out.get_pixel(0, 4)[0] < 30);
+        assert!(out.get_pixel(7, 4)[0] > 220);
+        assert_eq!(out.get_pixel(0, 0)[3], 255, "opaque paint over translucent backdrop");
+    }
+
+    #[test]
+    fn multiply_blend_darkens() {
+        let op = Op::Gradient {
+            kind: GradientKind::Radial,
+            x0: 0.5, y0: 0.5, x1: 1.0, y1: 1.0,
+            from: [128, 128, 128, 255], to: [128, 128, 128, 255],
+            opacity: 1.0, blend: Blend::Multiply,
+        };
+        let img = RgbaImage::from_pixel(8, 8, Rgba([200, 200, 200, 255]));
+        let p = apply_all(&img, &[op]).get_pixel(3, 3).0;
+        assert!((99..=102).contains(&p[0]), "200 × 0.5 should be ~100, got {}", p[0]);
+    }
+
+    #[test]
+    fn shapes_fill_and_stroke_where_drawn() {
+        let rect = Shape {
+            kind: ShapeKind::Rect, x0: 0.25, y0: 0.25, x1: 0.75, y1: 0.75,
+            fill: Some([255, 0, 0, 255]), stroke: Some([0, 0, 255, 255]), width: 0.05,
+        };
+        let out = apply_all(&white(100, 100), &[Op::Shapes { items: vec![rect.clone()] }]);
+        assert_eq!(out.get_pixel(50, 50).0, [255, 0, 0, 255], "inside is filled");
+        assert_eq!(out.get_pixel(25, 50).0, [0, 0, 255, 255], "the edge is stroked");
+        assert_eq!(out.get_pixel(5, 5).0, [255, 255, 255, 255], "outside is untouched");
+
+        // Like paint, shapes stay on the subject when the frame rotates.
+        let dot = Shape { kind: ShapeKind::Ellipse, x0: 0.1, y0: 0.1, x1: 0.3, y1: 0.3, fill: Some([0, 0, 0, 255]), stroke: None, width: 0.0 };
+        let turned = apply_all(&white(100, 100), &[Op::Rotate { turns: 1 }, Op::Shapes { items: vec![dot] }]);
+        assert_eq!(turned.get_pixel(80, 20).0, [0, 0, 0, 255]);
+        assert_eq!(turned.get_pixel(20, 20).0, [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn v3_ops_round_trip_through_json() {
+        let ops = vec![
+            Op::Levels { in_black: 0.1, in_white: 0.9, gamma: 1.2, out_black: 0.0, out_white: 1.0 },
+            Op::Curves { rgb: vec![0.0, 0.0, 0.5, 0.6, 1.0, 1.0], red: vec![], green: vec![], blue: vec![] },
+            Op::Hue { degrees: 30.0 },
+            Op::PhotoFilter { color: [236, 138, 0], density: 0.25 },
+            Op::Shapes { items: vec![Shape { kind: ShapeKind::Line, x0: 0.0, y0: 0.0, x1: 1.0, y1: 1.0, fill: None, stroke: Some([1, 2, 3, 4]), width: 0.01 }] },
+        ];
+        let json = serde_json::to_string(&ops).unwrap();
+        assert_eq!(serde_json::from_str::<Vec<Op>>(&json).unwrap(), ops);
+        // Optional fields may be omitted by hand-written manifests.
+        let g: Op = serde_json::from_str(r#"{"op":"gradient","kind":"radial","x0":0,"y0":0,"x1":1,"y1":1,"from":[0,0,0,255],"to":[0,0,0,0]}"#).unwrap();
+        assert!(matches!(g, Op::Gradient { opacity, blend: Blend::Normal, .. } if opacity == 1.0));
     }
 }

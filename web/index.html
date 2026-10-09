@@ -42,16 +42,22 @@
 </nav>
 <main id="image-workspace">
   <nav class="tool-rail" aria-label="Image tools">
+    <button class="btn" data-tool="hand" title="Hand — pan the view (H, or hold Space)" aria-label="Hand">✋</button>
     <button class="btn" data-tool="crop" title="Crop (C)" aria-label="Crop">⌗</button>
     <button class="btn" data-tool="lasso" title="Lasso (L)" aria-label="Lasso">♧</button>
     <button class="btn" data-tool="paint" title="Brush (B)" aria-label="Brush">✎</button>
     <button class="btn" data-tool="eraser" title="Eraser (E)" aria-label="Eraser">▱</button>
-    <button class="btn" id="tool-eyedropper" title="Sample image color (I)" aria-label="Eyedropper">◉</button>
+    <button class="btn" data-tool="gradient" title="Gradient (G)" aria-label="Gradient">◐</button>
+    <button class="btn" data-tool="shape" title="Shapes (U)" aria-label="Shapes">▭</button>
+    <button class="btn" data-tool="eyedropper" id="tool-eyedropper" title="Sample image color (I)" aria-label="Eyedropper">◉</button>
+    <span class="rail-gap"></span>
+    <button class="btn" id="btn-shortcuts" title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts">?</button>
   </nav>
   <aside class="panel" id="panel" aria-label="Adjustments">
     <div class="panel-empty" id="panel-empty">
       <p>No image open.</p>
       <p class="dim">Import a file or open a saved project to begin.</p>
+      <p class="dim" id="limits-note"></p>
     </div>
 
     <div class="panel-body" id="panel-body" hidden>
@@ -60,8 +66,19 @@
         <button class="btn sm" id="btn-redo" disabled title="Redo (Ctrl+Shift+Z)">↷ Redo</button>
       </div>
 
-      <section class="group">
-        <h2>Frame</h2>
+      <details class="group" open>
+        <summary>History</summary>
+        <ol class="history-list" id="history-list" aria-label="Edit history"></ol>
+      </details>
+
+      <details class="group" open>
+        <summary>Histogram</summary>
+        <canvas id="histogram" width="440" height="140" aria-label="Image RGB and luminance histogram"></canvas>
+        <p class="note" id="document-info">No document</p>
+      </details>
+
+      <details class="group" open>
+        <summary>Frame</summary>
         <div class="row-btns">
           <button class="btn sm" data-act="rot-ccw" title="Rotate left">⟲</button>
           <button class="btn sm" data-act="rot-cw" title="Rotate right">⟳</button>
@@ -72,40 +89,73 @@
         <button class="btn wide ghost" id="btn-uncrop" hidden>Remove crop</button>
         <button class="btn wide" id="btn-lasso">Scissors</button>
         <button class="btn wide ghost" id="btn-unlasso" hidden>Remove cut-out</button>
-      </section>
+      </details>
 
-      <section class="group">
-        <h2>Draw</h2>
-        <button class="btn wide" id="btn-paint">Brush</button>
+      <details class="group" open>
+        <summary>Draw</summary>
+        <div class="row-btns three">
+          <button class="btn sm" id="btn-paint">Brush</button>
+          <button class="btn sm" id="btn-gradient">Gradient</button>
+          <button class="btn sm" id="btn-shape">Shape</button>
+        </div>
         <button class="btn wide ghost" id="btn-clear-ink" hidden>Clear all drawing</button>
-      </section>
+        <button class="btn wide ghost" id="btn-clear-gradients" hidden>Clear gradients</button>
+        <button class="btn wide ghost" id="btn-clear-shapes" hidden>Clear shapes</button>
+      </details>
 
-      <section class="group"><h2>Histogram</h2><canvas id="histogram" width="220" height="70" aria-label="Image luminance histogram"></canvas><p class="note" id="document-info">No document</p></section>
-      <section class="group">
-        <h2>Tone</h2>
-        <label class="slider">
-          <span>Brightness</span><output id="o-brightness">0</output>
-          <input type="range" id="s-brightness" min="-100" max="100" value="0">
-        </label>
-        <label class="slider">
-          <span>Contrast</span><output id="o-contrast">0</output>
-          <input type="range" id="s-contrast" min="-100" max="100" value="0">
-        </label>
-        <label class="slider">
-          <span>Saturation</span><output id="o-saturation">0</output>
-          <input type="range" id="s-saturation" min="-100" max="100" value="0">
-        </label>
-      </section>
+      <details class="group" open>
+        <summary>Basic</summary>
+        <div class="sliders" data-section="basic"></div>
+      </details>
 
-      <section class="group">
-        <h2>Detail &amp; color</h2><label class="slider"><span>Exposure</span><output id="o-exposure">0</output><input type="range" id="s-exposure" min="-100" max="100" value="0"></label><label class="slider"><span>Temperature</span><output id="o-warmth">0</output><input type="range" id="s-warmth" min="-100" max="100" value="0"></label><label class="slider"><span>Sharpen</span><output id="o-sharpen">0</output><input type="range" id="s-sharpen" min="0" max="100" value="0"></label>
-        <label class="slider">
-          <span>Blur</span><output id="o-blur">0</output>
-          <input type="range" id="s-blur" min="0" max="100" value="0">
-        </label>
+      <details class="group">
+        <summary>Levels</summary>
+        <div class="sliders" data-section="levels"></div>
+        <div class="row-btns two">
+          <button class="btn sm" id="btn-auto-levels" title="Stretch the tonal range to the darkest and lightest pixels">Auto</button>
+          <button class="btn sm ghost" id="btn-reset-levels">Reset</button>
+        </div>
+      </details>
+
+      <details class="group">
+        <summary>Curves</summary>
+        <div class="seg four" id="curve-chan" role="group" aria-label="Curve channel">
+          <button class="btn sm" data-chan="rgb" aria-pressed="true">RGB</button>
+          <button class="btn sm" data-chan="red" aria-pressed="false">R</button>
+          <button class="btn sm" data-chan="green" aria-pressed="false">G</button>
+          <button class="btn sm" data-chan="blue" aria-pressed="false">B</button>
+        </div>
+        <canvas id="curves" width="440" height="440" aria-label="Tone curve editor. Click to add a point, drag to move, double-click to remove."></canvas>
+        <p class="note tight">Click to add a point · drag to shape · double-click or drag off to remove</p>
+        <button class="btn wide ghost" id="btn-reset-curve">Reset this curve</button>
+      </details>
+
+      <details class="group">
+        <summary>Color</summary>
+        <div class="sliders" data-section="color"></div>
+        <div class="filter-row">
+          <label class="inline"><span>Photo filter</span><input type="color" id="filter-color" value="#ec8a00"></label>
+          <select id="filter-preset" aria-label="Photo filter preset">
+            <option value="">Preset…</option>
+            <option value="#ec8a00">Warming (85)</option>
+            <option value="#fa9600">Warming (LBA)</option>
+            <option value="#006dff">Cooling (80)</option>
+            <option value="#00b5ff">Cooling (82)</option>
+            <option value="#ac7a33">Sepia</option>
+            <option value="#ea1a1a">Red</option>
+            <option value="#19c919">Green</option>
+          </select>
+        </div>
+        <div class="sliders" data-section="filter"></div>
         <label class="check"><input type="checkbox" id="c-grayscale"><span>Black &amp; white</span></label>
         <label class="check"><input type="checkbox" id="c-invert"><span>Invert</span></label>
-      </section>
+      </details>
+
+      <details class="group">
+        <summary>Effects &amp; filters</summary>
+        <div class="sliders" data-section="effects"></div>
+        <label class="check"><input type="checkbox" id="c-noiseMono"><span>Monochrome noise</span></label>
+      </details>
 
       <section class="group">
         <button class="btn wide ghost" id="btn-reset">Reset all edits</button>
@@ -115,7 +165,14 @@
   </aside>
 
   <section class="stage" id="stage">
-    <div class="view-bar"><button class="btn sm" id="view-fit">Fit</button><label>Zoom <select id="view-zoom"><option value="1">100% of fit</option><option value="1.5">150%</option><option value="2">200%</option><option value="3">300%</option></select></label><button class="btn sm" id="view-original" aria-pressed="false">Compare original</button></div>
+    <div class="view-bar">
+      <button class="btn sm" id="view-fit" title="Fit to window (Ctrl+0)">Fit</button>
+      <button class="btn sm" id="view-out" title="Zoom out (Ctrl+−, or Ctrl+scroll)" aria-label="Zoom out">−</button>
+      <label>Zoom <select id="view-zoom"><option value="1">Fit</option><option value="1.5">150%</option><option value="2">200%</option><option value="3">300%</option><option value="4">400%</option><option value="6">600%</option><option value="8">800%</option></select></label>
+      <button class="btn sm" id="view-in" title="Zoom in (Ctrl+=, or Ctrl+scroll)" aria-label="Zoom in">+</button>
+      <button class="btn sm" id="view-original" aria-pressed="false" title="Hold to compare (\)">Compare original</button>
+      <span class="view-tool" id="view-tool"></span>
+    </div>
     <div class="stage-inner">
       <canvas id="canvas" width="1" height="1"></canvas>
       <canvas id="ink" class="ink" hidden></canvas>
@@ -162,6 +219,37 @@
       </div>
     </div>
 
+    <div class="tool-bar" id="gradient-bar" hidden>
+      <select id="g-kind" aria-label="Gradient type"><option value="linear">Linear</option><option value="radial">Radial</option></select>
+      <label class="inline"><span>From</span><input type="color" id="g-from" value="#000000"></label>
+      <label class="inline"><span>To</span><input type="color" id="g-to" value="#ffffff"></label>
+      <label class="check inline"><input type="checkbox" id="g-clear"><span>to transparent</span></label>
+      <select id="g-blend" aria-label="Blend mode">
+        <option value="normal">Normal</option><option value="multiply">Multiply</option><option value="screen">Screen</option>
+        <option value="overlay">Overlay</option><option value="soft_light">Soft light</option><option value="hard_light">Hard light</option>
+        <option value="darken">Darken</option><option value="lighten">Lighten</option><option value="difference">Difference</option>
+        <option value="color_dodge">Color dodge</option><option value="color_burn">Color burn</option>
+      </select>
+      <label class="inline"><span>Opacity</span><input type="range" id="g-opacity" min="5" max="100" value="100"></label>
+      <span class="tool-hint">Drag across the image</span>
+      <button class="btn sm btn-key" id="btn-gradient-done">Done</button>
+    </div>
+
+    <div class="tool-bar" id="shape-bar" hidden>
+      <div class="seg three" id="shape-kind" role="group" aria-label="Shape">
+        <button class="btn sm" data-kind="rect" aria-pressed="true" title="Rectangle">▭</button>
+        <button class="btn sm" data-kind="ellipse" aria-pressed="false" title="Ellipse">◯</button>
+        <button class="btn sm" data-kind="line" aria-pressed="false" title="Line">╱</button>
+      </div>
+      <label class="check inline"><input type="checkbox" id="sh-fill-on" checked><span>Fill</span></label>
+      <input type="color" id="sh-fill" value="#8dbbff" aria-label="Fill colour">
+      <label class="check inline"><input type="checkbox" id="sh-stroke-on"><span>Stroke</span></label>
+      <input type="color" id="sh-stroke" value="#14120e" aria-label="Stroke colour">
+      <label class="inline"><span>Width</span><input type="range" id="sh-width" min="1" max="100" value="12"></label>
+      <span class="tool-hint">Drag to draw · Shift constrains</span>
+      <button class="btn sm btn-key" id="btn-shape-done">Done</button>
+    </div>
+
     <div class="crop-bar" id="crop-bar" hidden>
       <label class="inline">
         <span>Ratio</span>
@@ -185,41 +273,106 @@
 </main>
 
 <section id="video-workspace" hidden aria-label="Video editor">
-  <aside class="video-properties panel">
-    <h2>Video properties</h2><button class="btn wide btn-key" id="video-import">Import video</button>
-    <p class="note" id="video-name">Open a local clip to begin.</p>
-    <fieldset id="video-controls" disabled>
-      <section class="group"><h2>Trim</h2>
-        <label class="video-field">In point (seconds)<input id="video-in" type="number" min="0" step="0.01" value="0"></label>
-        <button class="btn sm" id="video-mark-in">Set in at playhead</button>
-        <label class="video-field">Out point (seconds)<input id="video-out" type="number" min="0" step="0.01" value="0"></label>
-        <button class="btn sm" id="video-mark-out">Set out at playhead</button>
-      </section>
-      <section class="group"><h2>Playback &amp; audio</h2>
-        <label class="video-field">Speed<select id="video-speed"><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="1.5">1.5×</option><option value="2">2×</option></select></label>
-        <label class="slider"><span>Volume</span><output id="video-volume-value">100%</output><input id="video-volume" type="range" min="0" max="100" value="100"></label>
-        <label class="check"><input id="video-mute" type="checkbox">Mute audio</label>
-      </section>
-      <section class="group"><h2>Color grade</h2>
-        <label class="slider"><span>Brightness</span><input aria-label="Video brightness" id="video-brightness" type="range" min="50" max="150" value="100"></label>
-        <label class="slider"><span>Contrast</span><input aria-label="Video contrast" id="video-contrast" type="range" min="50" max="150" value="100"></label>
-        <label class="slider"><span>Saturation</span><input aria-label="Video saturation" id="video-saturation" type="range" min="0" max="200" value="100"></label>
-        <button class="btn wide" id="video-reset">Reset edits</button>
-      </section>
-      <button class="btn wide btn-key" id="video-export">Export edited video</button>
-      <p class="note">Export records the selected range in real time, up to 1080p. Keep this tab visible. Format depends on your browser. Video edits last for this session.</p>
-    </fieldset>
+  <aside class="panel vpanel vbin" aria-label="Media bin">
+    <div class="vhead"><h2>Media</h2><button class="btn sm btn-key" id="v-import">Import</button></div>
+    <button class="btn wide" id="v-relink" hidden>Relink offline media…</button>
+    <ul class="bin" id="v-bin"></ul>
+    <p class="note" id="v-bin-empty">Import video, audio, or images, then drag them onto the timeline or double-click to add.</p>
+    <div class="vhead"><h2>Project</h2></div>
+    <div class="vbtns">
+      <button class="btn sm" id="v-open" title="Open a saved video project (Ctrl+O)">Open…</button>
+      <button class="btn sm" id="v-save" title="Save the project (Ctrl+S)">Save…</button>
+      <button class="btn sm" id="v-srt-in" title="Import SubRip captions onto V2">Import SRT</button>
+      <button class="btn sm" id="v-srt-out" title="Export captions as SubRip">Export SRT</button>
+    </div>
+    <p class="note" id="v-limits"></p>
   </aside>
-  <div class="video-main">
-    <div class="video-view"><video id="video" playsinline preload="metadata" hidden></video><div id="video-empty"><h2>A little motion. A new story.</h2><p>Import a video to trim, color, and export.</p></div></div>
-    <div class="video-timeline"><div class="transport"><button class="btn" id="video-play" disabled>Play</button><output id="video-time">00:00 / 00:00</output><span id="video-duration">No clip loaded</span></div>
-      <input id="video-seek" type="range" min="0" max="1" step="0.01" value="0" aria-label="Video playhead" disabled>
-      <div class="trim-track"><div id="video-range">Selected clip</div></div>
-      <p role="status" id="video-status">Files stay on your machine.</p><button class="btn sm" id="video-cancel" hidden>Cancel export</button>
+
+  <div class="vmonitor">
+    <div class="vview">
+      <canvas id="v-canvas" width="2" height="2" aria-label="Program monitor"></canvas>
+      <div class="v-empty" id="v-empty"><h2>A little motion. A new story.</h2><p>Import clips, then cut, grade, title, and mix them.</p></div>
+    </div>
+    <div class="vtransport">
+      <button class="btn sm" id="v-start" title="Go to start (Home)" aria-label="Go to start">⏮</button>
+      <button class="btn sm" id="v-back" title="Previous frame (←)" aria-label="Previous frame">◀</button>
+      <button class="btn btn-key" id="v-play" title="Play / pause (Space)">Play</button>
+      <button class="btn sm" id="v-fwd" title="Next frame (→)" aria-label="Next frame">▶</button>
+      <button class="btn sm" id="v-end" title="Go to end (End)" aria-label="Go to end">⏭</button>
+      <output id="v-tc">00:00:00:00</output><span class="dim" id="v-dur">/ 00:00:00:00</span>
+      <label class="check inline"><input type="checkbox" id="v-loop"><span>Loop</span></label>
+      <div class="meter" title="Output level"><div id="v-meter"></div></div>
+      <span class="spacer"></span>
+      <button class="btn sm" id="v-still" title="Save the current frame as PNG">Export frame</button>
+      <button class="btn sm btn-key" id="v-export" title="Export video (Ctrl+M)">Export video</button>
     </div>
   </div>
-  <input type="file" accept="video/*" id="file-video" hidden>
+
+  <aside class="panel vpanel vinspector" aria-label="Inspector">
+    <div class="vhead"><h2 id="v-insp-title">Sequence</h2></div>
+    <div id="v-inspector"></div>
+    <details class="group vscopes" open><summary>Luma waveform</summary><canvas id="v-scope" width="256" height="120" aria-label="Luma waveform scope"></canvas></details>
+  </aside>
+
+  <div class="vtimeline">
+    <div class="vtl-bar">
+      <div class="seg two" role="group" aria-label="Timeline tool">
+        <button class="btn sm" data-vtool="select" aria-pressed="true" title="Selection tool (V)">⇱ Select</button>
+        <button class="btn sm" data-vtool="razor" aria-pressed="false" title="Razor tool (C)">✂ Razor</button>
+      </div>
+      <button class="btn sm" id="v-split" title="Split at playhead (Ctrl+K)">Split</button>
+      <button class="btn sm" id="v-delete" title="Delete; closes the gap on V1 (Delete)">Delete</button>
+      <button class="btn sm" id="v-title" title="Add a title at the playhead (T)">+ Title</button>
+      <button class="btn sm" id="v-marker" title="Add a marker at the playhead (M)">+ Marker</button>
+      <button class="btn sm" id="v-snap" aria-pressed="true" title="Snapping (S)">Snap</button>
+      <button class="btn sm" id="v-undo" disabled aria-label="Undo">↶</button>
+      <button class="btn sm" id="v-redo" disabled aria-label="Redo">↷</button>
+      <span class="vstatus" id="v-status" role="status">Files stay on your machine.</span>
+      <button class="btn sm" id="v-cancel" hidden>Cancel export</button>
+      <label class="inline"><span>Zoom</span><input type="range" id="v-zoom" min="0" max="100" value="40" aria-label="Timeline zoom"></label>
+      <button class="btn sm" id="v-fit" title="Fit sequence (\)">Fit</button>
+    </div>
+    <div class="vtl">
+      <div class="vtl-heads" aria-hidden="true">
+        <div class="vtl-rulerhead"></div>
+        <div class="vtl-head">V2 · Titles</div>
+        <div class="vtl-head">V1 · Video</div>
+        <div class="vtl-head">A2 · Audio</div>
+      </div>
+      <div class="vtl-scroll" id="v-scroll">
+        <div class="vtl-content" id="v-content">
+          <canvas class="vtl-ruler" id="v-ruler"></canvas>
+          <div class="vtl-track" data-track="v2"></div>
+          <div class="vtl-track" data-track="v1"></div>
+          <div class="vtl-track" data-track="a2"></div>
+          <div class="vtl-playhead" id="v-playhead"></div>
+          <div class="vtl-drop" id="v-drop" hidden></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <input type="file" id="file-video" accept="video/*,audio/*,image/*" multiple hidden>
+  <input type="file" id="file-relink" accept="video/*,audio/*,image/*" multiple hidden>
+  <input type="file" id="file-vproject" accept=".json,application/json" hidden>
+  <input type="file" id="file-srt" accept=".srt,text/plain" hidden>
 </section>
+
+<dialog class="sheet" id="vexport-dialog">
+  <h2>Export video</h2>
+  <div class="field">
+    <label class="vfield"><span class="field-label flush">Format</span><select id="vx-format"></select></label>
+  </div>
+  <div class="field">
+    <label class="vfield"><span class="field-label flush">Quality</span><select id="vx-quality"></select></label>
+  </div>
+  <dl class="readout" id="vx-info"></dl>
+  <p class="hint" id="vx-warn"></p>
+  <div class="sheet-actions">
+    <button class="btn ghost" id="vx-cancel">Cancel</button>
+    <button class="btn btn-key" id="vx-go">Export</button>
+  </div>
+</dialog>
 <!-- Signature: loaded images as a negative sleeve. -->
 <footer class="sleeve" id="sleeve" aria-label="Open images">
   <div class="sprockets" aria-hidden="true"></div>
@@ -232,11 +385,21 @@
 
   <div class="field">
     <span class="field-label">Format</span>
-    <div class="seg" id="fmt-seg">
+    <div class="seg three" id="fmt-seg">
       <button class="btn sm" data-fmt="png">PNG</button>
       <button class="btn sm" data-fmt="jpeg">JPEG</button>
+      <button class="btn sm" data-fmt="webp">WebP</button>
     </div>
     <p class="hint" id="fmt-hint"></p>
+  </div>
+
+  <div class="field">
+    <label class="inline"><span class="field-label flush">Image size</span>
+      <select id="x-scale">
+        <option value="0.25">25%</option><option value="0.5">50%</option><option value="0.75">75%</option>
+        <option value="1" selected>100%</option><option value="1.5">150%</option><option value="2">200%</option>
+      </select>
+    </label>
   </div>
 
   <div class="field" id="quality-field">
@@ -255,6 +418,29 @@
     <button class="btn ghost" id="btn-export-cancel">Cancel</button>
     <button class="btn btn-key" id="btn-export-go">Choose location…</button>
   </div>
+</dialog>
+
+<dialog class="sheet wide-sheet" id="shortcuts-dialog">
+  <h2>Keyboard shortcuts</h2>
+  <dl class="keys">
+    <div><dt>H / hold Space</dt><dd>Hand — pan</dd></div>
+    <div><dt>C</dt><dd>Crop</dd></div>
+    <div><dt>L</dt><dd>Lasso scissors</dd></div>
+    <div><dt>B / E</dt><dd>Brush / eraser</dd></div>
+    <div><dt>[ / ]</dt><dd>Brush or stroke size</dd></div>
+    <div><dt>G</dt><dd>Gradient</dd></div>
+    <div><dt>U</dt><dd>Shapes</dd></div>
+    <div><dt>I</dt><dd>Eyedropper</dd></div>
+    <div><dt>\</dt><dd>Compare original</dd></div>
+    <div><dt>Escape</dt><dd>Leave the current tool</dd></div>
+    <div><dt>Ctrl+Z / Ctrl+Shift+Z</dt><dd>Undo / redo</dd></div>
+    <div><dt>Ctrl+= / Ctrl+− / Ctrl+0</dt><dd>Zoom in / out / fit</dd></div>
+    <div><dt>Ctrl+scroll</dt><dd>Zoom</dd></div>
+    <div><dt>Ctrl+O / Ctrl+S</dt><dd>Open / save project</dd></div>
+    <div><dt>Ctrl+Shift+E</dt><dd>Export image</dd></div>
+    <div><dt>?</dt><dd>This list</dd></div>
+  </dl>
+  <div class="sheet-actions"><button class="btn btn-key" id="btn-shortcuts-close">Close</button></div>
 </dialog>
 
 <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>

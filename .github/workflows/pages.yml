@@ -32,8 +32,8 @@ jobs:
       - name: Check image engine and JavaScript
         run: |
           cargo test --locked
-          node --input-type=module --check < web/app.js
-          node --input-type=module --check < web/video.js
+          for f in web/app.js web/video.js web/video/*.js; do node --input-type=module --check < "$f"; done
+          node --test tests/
 
       - name: Build browser image engine
         run: |
