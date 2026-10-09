@@ -6,22 +6,26 @@ import { startVideo, pauseVideo, isExporting } from "./video/ui.js";
 
 const $ = (id) => document.getElementById(id);
 
+const HINTS = { image: "Develop, retouch, and refine", pdf: "Organize, comment, fill, sign, redact, and protect", video: "Cut, grade, title, and mix" };
+
 function switchWorkspace(mode) {
   if (isExporting()) { $("v-status").textContent = "Finish or cancel the export before changing workspace."; return; }
   const isVideo = mode === "video";
-  $("image-workspace").hidden = isVideo;
-  $("sleeve").hidden = isVideo;
-  document.querySelector(".bar-actions").hidden = isVideo;
+  $("image-workspace").hidden = mode !== "image";
+  $("sleeve").hidden = mode !== "image";
+  document.querySelector(".bar-actions").hidden = mode !== "image";
+  $("pdf-workspace").hidden = mode !== "pdf";
   $("video-workspace").hidden = !isVideo;
-  for (const name of ["image", "video"]) {
+  for (const name of ["image", "pdf", "video"]) {
     $("mode-" + name).classList.toggle("selected", name === mode);
     $("mode-" + name).setAttribute("aria-pressed", String(name === mode));
   }
-  $("workspace-hint").textContent = isVideo ? "Cut, grade, title, and mix" : "Develop, retouch, and refine";
+  $("workspace-hint").textContent = HINTS[mode];
   if (isVideo) startVideo(); else pauseVideo();
-  document.dispatchEvent(new Event("workspacechange"));
+  document.dispatchEvent(new CustomEvent("workspacechange", { detail: mode }));
   window.dispatchEvent(new Event("resize"));
 }
 
 $("mode-image").onclick = () => switchWorkspace("image");
 $("mode-video").onclick = () => switchWorkspace("video");
+$("mode-pdf").onclick = () => switchWorkspace("pdf");

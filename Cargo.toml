@@ -3,6 +3,9 @@ name = "darkroom"
 version = "0.1.0"
 edition = "2021"
 
+[workspace]
+members = [".", "pdf"]
+
 [lib]
 crate-type = ["cdylib", "rlib"]
 
@@ -31,3 +34,11 @@ opt-level = 3
 lto = true
 codegen-units = 1
 panic = "abort"
+# PdfCraft carries small safety patches to these crates in its `vendor/`
+# folder. Its own [patch] table does not apply to projects that depend on it,
+# so the PDF engine repeats it here, at the same pinned commit.
+[patch.crates-io]
+hayro = { git = "https://github.com/storytold/pdfcraft", rev = "f1af1e2e79ba9d2df3cb7debf88098b952dc6fd7" }
+hayro-interpret = { git = "https://github.com/storytold/pdfcraft", rev = "f1af1e2e79ba9d2df3cb7debf88098b952dc6fd7" }
+hayro-syntax = { git = "https://github.com/storytold/pdfcraft", rev = "f1af1e2e79ba9d2df3cb7debf88098b952dc6fd7" }
+lopdf = { git = "https://github.com/storytold/pdfcraft", rev = "f1af1e2e79ba9d2df3cb7debf88098b952dc6fd7" }

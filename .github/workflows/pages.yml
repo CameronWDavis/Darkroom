@@ -29,20 +29,22 @@ jobs:
           rustup toolchain install stable --profile minimal --target wasm32-unknown-unknown
           rustup default stable
 
-      - name: Check image engine and JavaScript
+      - name: Check engines and JavaScript
         run: |
-          cargo test --locked
-          for f in web/app.js web/video.js web/video/*.js; do node --input-type=module --check < "$f"; done
+          cargo test --locked --workspace
+          for f in web/app.js web/video.js web/video/*.js web/pdf/ui.js; do node --input-type=module --check < "$f"; done
           node --test tests/*.test.mjs
 
-      - name: Build browser image engine
+      - name: Build browser image and PDF engines
         run: |
-          cargo build --locked --release --target wasm32-unknown-unknown
+          cargo build --locked --release --target wasm32-unknown-unknown -p darkroom -p darkroom-pdf
           bindgen_version=$(python3 -c 'import tomllib; lock = tomllib.load(open("Cargo.lock", "rb")); print(next(p["version"] for p in lock["package"] if p["name"] == "wasm-bindgen"))')
           cargo install wasm-bindgen-cli --version "$bindgen_version" --locked
           wasm-bindgen --target web --out-dir web/pkg target/wasm32-unknown-unknown/release/darkroom.wasm
+          wasm-bindgen --target web --out-dir web/pdf/pkg target/wasm32-unknown-unknown/release/darkroom_pdf.wasm
           test -s web/index.html
           test -s web/pkg/darkroom.js
+          test -s web/pdf/pkg/darkroom_pdf.js
           test -s web/pkg/darkroom_bg.wasm
 
       - name: Upload downloadable website

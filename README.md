@@ -1,18 +1,19 @@
 # Darkroom — In-Browser Video & Image Editor
 
-Darkroom is an in-browser video and image editor for editing photos, retouching images, and cutting, grading, and titling video. It brings a Photoshop-inspired image workspace and a Premiere-inspired multi-track video editor together in one local creative studio.
+Darkroom is an in-browser video, image and PDF editor for editing photos, retouching images, marking up and signing documents, and cutting, grading, and titling video. It brings a Photoshop-inspired image workspace, an Acrobat-style PDF workspace and a Premiere-inspired multi-track video editor together in one local creative studio.
 
 Import files from your computer, make your edits, and export the result—all processing happens in your browser. Your images and videos are never uploaded to a server.
 
 ## What you can do
 
 - **Edit images:** crop, rotate, flip, cut out subjects with a lasso, draw with brushes, and refine color and detail.
+- **Edit PDFs:** organize, merge and split pages; highlight, comment and draw; fill in forms and sign; add text and images; redact; and protect with a password.
 - **Edit video:** cut clips together on a multi-track timeline with transitions, color grading, titles, captions, motion, and a music track, then export MP4 or WebM.
 - **Work locally:** keep original media on your machine and save image projects as portable `.darkroom` files.
 
 ## Getting started
 
-1. Open Darkroom and choose **Image studio** or **Video studio**.
+1. Open Darkroom and choose **Image studio**, **Edit PDF** or **Video studio**.
 2. Import an image or video from your computer. Images can also be dropped onto the image workspace.
 3. Use the tools and properties panel to make adjustments.
 4. Export the finished image or video. Use **Save project** in Image studio to preserve your originals and editable instructions, or **Save…** in Video studio to keep the sequence.
@@ -73,6 +74,21 @@ Unused photo assets are retained in the current session so undo can restore remo
 
 Sizes declared inside a zip are never trusted on their own: each entry is read through a hard cap, and its real decompressed size and ratio are measured. Image headers are checked for dimensions before any pixels are decoded. Video project files are rebuilt field by field from known defaults, so unknown keys and out-of-range values never reach the editor. The limits live in [src/limits.rs](src/limits.rs) and [web/video/model.js](web/video/model.js).
 
+## Edit PDF
+
+The **Edit PDF** workspace opens, edits and saves PDFs with the engine of [PdfCraft](https://github.com/storytold/pdfcraft), an open-source reimplementation of Adobe Acrobat in Rust, compiled to WebAssembly and loaded the first time you open the tab. Several PDFs can be open at once in tabs; drop files on the viewer or use **Open**.
+
+- **View and find:** continuous pages with fit-width, fit-page and 25–600% zoom (Ctrl/Cmd+scroll), page thumbnails, page labels, and search with match-case and whole-word options. Select text with the Select tool and copy it with Ctrl/Cmd+C.
+- **Organize pages:** select thumbnails (click, Ctrl/Cmd-click, Shift-click) to rotate, delete, duplicate or move them, drag thumbnails to reorder, insert blank pages or pages from another PDF (merge), extract the selection as a new PDF, or split every *n* pages.
+- **Comment:** highlight, underline and strike through text; sticky notes with replies; text boxes; freehand drawing; rectangles, ovals, lines and arrows; and Acrobat's standard stamps. Choose color, opacity, line width and author. Move comments with the Select tool, edit or delete them in the panel, and find them all in the Comments list.
+- **Fill & Sign:** fill text fields, check boxes, radio buttons and lists right on the page; type text anywhere; add check, cross and dot marks; and sign with a drawn or typed signature (or click a signature field). Clear the form or flatten fields into the page. These are visible signatures, like Acrobat's Fill & Sign, not certificate-based digital signatures.
+- **Edit:** add page text (Helvetica, Times or Courier, with size, color, weight and alignment) and PNG or JPEG images; flatten comments; or send a page to Image studio at 144 dpi for retouching.
+- **Redact:** mark areas, or every match of a word or phrase, then apply the marks to remove the text, images and drawings beneath them from the file for good.
+- **Protect and describe:** AES-256 password protection with open and permissions passwords (printing, changes, copying), removal of security, and title, author, subject and keywords.
+- Every change can be undone and redone (Ctrl/Cmd+Z, Ctrl/Cmd+Shift+Z). **Save PDF** (Ctrl/Cmd+S) writes the edited document; unchanged documents are appended to rather than rewritten, so the original bytes remain inside the saved file. Shortcuts: **V** select, **H** hand (or hold Space), **N** note, **D** draw, **X** text box, **Delete** removes the selected comment.
+
+Protected PDFs ask for their password when opened. Editing existing page text and digital signatures with certificates are not offered yet. The PDF engine is about 5.5 MB to download (compressed) and is fetched only when the Edit PDF tab is first opened.
+
 ## Video studio
 
 A multi-track editor modelled on Premiere Pro's workflow, rendered on the GPU with WebGL 2.
@@ -96,24 +112,27 @@ Export plays the sequence in real time through the same GPU compositor as the pr
 
 ## Privacy and storage
 
-All media processing runs locally in the browser. Darkroom does not upload your files or automatically save media or edits to browser storage.
+All media processing runs locally in the browser. Darkroom does not upload your files or automatically save media or edits to browser storage. PDFs are opened, edited and saved inside the page, and their passwords never leave it.
 
 Web fonts are loaded from Google Fonts, so the page can make network requests for typography. Your media remains on your machine.
 
 ## Build and run locally
 
-The image engine is written in Rust and compiled to WebAssembly. The interface uses HTML, CSS, and JavaScript; video editing uses browser media APIs.
+The image engine (`src/`) and the PDF engine (`pdf/`, a bridge over [PdfCraft](https://github.com/storytold/pdfcraft)'s crates, pinned to one commit) are written in Rust and compiled to WebAssembly. The interface uses HTML, CSS, and JavaScript; video editing uses browser media APIs.
 
-Prerequisites: Rust 1.88 or newer (required by the locked `image` crate), `wasm-pack`, and Python 3 for the local web server.
+Prerequisites: Rust 1.90 or newer (required by PdfCraft), `wasm-pack`, and Python 3 for the local web server.
 
 ```sh
 rustup target add wasm32-unknown-unknown
 cargo install wasm-pack
 wasm-pack build --target web --out-dir web/pkg
+wasm-pack build pdf --target web --out-dir ../web/pdf/pkg
 python3 -m http.server 8080 --directory web
 ```
 
-Open [Darkroom at localhost:8080](http://localhost:8080). The video workspace also works without the WebAssembly build. The image studio displays an error if its engine is missing.
+Open [Darkroom at localhost:8080](http://localhost:8080). The video workspace also works without the WebAssembly builds. The image studio and the PDF workspace each display an error if their engine is missing.
+
+PdfCraft keeps small safety patches to the `hayro` renderer and `lopdf` in its repository; the root `Cargo.toml` applies the same patches from the pinned commit. Update the commit in `pdf/Cargo.toml` and in that `[patch.crates-io]` table together.
 
 Video import and export support depends on the codecs and media APIs available in your browser. The export controls report when the browser cannot encode a video or apply its color adjustments.
 
@@ -121,7 +140,7 @@ Video import and export support depends on the codecs and media APIs available i
 
 The included [GitHub Actions workflow](.github/workflows/pages.yml) tests the app, compiles the image engine, and packages the complete `web` directory. Pushes and pull requests to `main` build the website; publishing is a separate, manual choice.
 
-Commit and push the source files, `Cargo.lock`, and `.github/workflows/pages.yml` to GitHub first. The generated `web/pkg` directory is intentionally ignored by Git: the workflow rebuilds it with a binding generator that matches `Cargo.lock`.
+Commit and push the source files, `Cargo.lock`, and `.github/workflows/pages.yml` to GitHub first. The generated `web/pkg` and `web/pdf/pkg` directories are intentionally ignored by Git: the workflow rebuilds it with a binding generator that matches `Cargo.lock`.
 
 ### Download the website for your own page
 
@@ -130,7 +149,7 @@ Commit and push the source files, `Cargo.lock`, and `.github/workflows/pages.yml
 3. Download the **darkroom-web** artifact from the completed run's **Artifacts** section and unzip it.
 4. Copy the extracted contents to your website's published directory, or a subfolder such as `darkroom/`.
 
-Keep `index.html`, `styles.css`, `app.js`, `video.js`, `.nojekyll`, and the entire `video/`, `fonts/`, and `pkg/` folders together. Relative asset paths allow the editor to run in a subfolder. Serve it over HTTPS with `.wasm` files served as `application/wasm`; GitHub Pages handles this for you.
+Keep `index.html`, `styles.css`, `app.js`, `video.js`, `.nojekyll`, and the entire `video/`, `pdf/`, `fonts/`, and `pkg/` folders together. Relative asset paths allow the editor to run in a subfolder. Serve it over HTTPS with `.wasm` files served as `application/wasm`; GitHub Pages handles this for you.
 
 If your existing GitHub Pages site publishes from a branch, put these built files in its selected root or `docs` directory (or a subfolder within it). The GitHub Pages branch selector cannot publish directly from a folder named `web`; use the workflow below for this repository instead. Do not upload only the source `web` folder without the compiled `pkg` files—the image editor needs them.
 
@@ -152,12 +171,14 @@ The layer and live-text workflow was inspired by [PhotoCraft](https://github.com
 
 The image studio's other text families are loaded from `web/fonts/` the first time they are used: [Rubik](https://github.com/googlefonts/rubik) (© 2015 Hubert & Fischer, [SIL Open Font License](web/fonts/Rubik-OFL.txt)), [Caladea](https://github.com/huertatipografica/Caladea) (© 2012 Huerta Tipográfica, [Apache License 2.0](web/fonts/Caladea-LICENSE.txt)), and [Liberation Mono](https://github.com/liberationfonts/liberation-fonts) (© 2010 Google Corporation, © 2012 Red Hat, Inc., [SIL Open Font License](web/fonts/LiberationMono-OFL.txt)). The files are the unmodified versions distributed with LibreOffice.
 
+The Edit PDF workspace is built on [PdfCraft](https://github.com/storytold/pdfcraft) (© the PdfCraft contributors, MIT OR Apache-2.0): its engine, renderer and document model crates are compiled into `web/pdf/pkg` unchanged. Darkroom's own code there is the bridge in `pdf/src` and the interface in `web/pdf`. The PdfCraft and ArtCraft names and logos are not used.
+
 ## Validation
 
 ```sh
-cargo test
-for f in web/app.js web/video.js web/video/*.js; do node --input-type=module --check < "$f"; done
+cargo test --workspace
+for f in web/app.js web/video.js web/video/*.js web/pdf/ui.js; do node --input-type=module --check < "$f"; done
 node --test tests/*.test.mjs
 ```
 
-For browser integration coverage, build the image engine, serve `web`, and run `node tests/image_layers.browser.cjs` with Playwright installed. The test covers text, drawing and shape layers, ordering, visibility, undo/redo, project reopening, and image export. Run `node tests/photo_layers.browser.cjs` for photo imports, transform handles, mask painting, adjustment ordering, styles, project reopening, and export, and `node tests/studio_tools.browser.cjs` for selections, glows and bevels, groups and clipping, guides, snapping and alignment, typography and imported fonts, retouching, and their project round trip. Set `DARKROOM_URL` to test another preview URL.
+For browser integration coverage, build the image engine, serve `web`, and run `node tests/image_layers.browser.cjs` with Playwright installed. The test covers text, drawing and shape layers, ordering, visibility, undo/redo, project reopening, and image export. Run `node tests/photo_layers.browser.cjs` for photo imports, transform handles, mask painting, adjustment ordering, styles, project reopening, and export, and `node tests/studio_tools.browser.cjs` for selections, glows and bevels, groups and clipping, guides, snapping and alignment, typography and imported fonts, retouching, and their project round trip. With the PDF engine built, `node tests/pdf_editor.browser.cjs` opens `tests/fixtures/form.pdf` and covers forms, comments and replies, Fill & Sign, added text and images, page organizing and extraction, search, redaction, properties, password protection, save and reopen, and sending a page to Image studio. Set `DARKROOM_URL` to test another preview URL.

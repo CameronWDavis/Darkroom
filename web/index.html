@@ -26,7 +26,7 @@
 </header>
 
 <nav class="workspace-bar" aria-label="Workspace">
-  <div class="seg"><button class="btn sm selected" id="mode-image" aria-pressed="true">Image studio</button><button class="btn sm" id="mode-video" aria-pressed="false">Video studio</button></div>
+  <div class="seg"><button class="btn sm selected" id="mode-image" aria-pressed="true">Image studio</button><button class="btn sm" id="mode-pdf" aria-pressed="false">Edit PDF</button><button class="btn sm" id="mode-video" aria-pressed="false">Video studio</button></div>
   <span id="workspace-hint">Develop, retouch, and refine</span>
 </nav>
 <main id="image-workspace">
@@ -397,6 +397,194 @@
   </section>
 </main>
 
+<section id="pdf-workspace" hidden aria-label="PDF editor">
+  <aside class="panel ppanel" aria-label="Pages, comments and search">
+    <div class="seg three" id="p-side" role="tablist" aria-label="Sidebar">
+      <button class="btn sm" data-side="pages" aria-pressed="true">Pages</button>
+      <button class="btn sm" data-side="comments" aria-pressed="false">Comments</button>
+      <button class="btn sm" data-side="search" aria-pressed="false">Search</button>
+    </div>
+    <div id="p-side-pages">
+      <div class="row-btns three p-page-tools">
+        <button class="btn sm" id="p-rot-l" title="Rotate selected pages left">⟲</button>
+        <button class="btn sm" id="p-rot-r" title="Rotate selected pages right">⟳</button>
+        <button class="btn sm" id="p-del" title="Delete selected pages">Delete</button>
+        <button class="btn sm" id="p-dup" title="Duplicate selected pages">Duplicate</button>
+        <button class="btn sm" id="p-blank" title="Insert a blank page after the selection">+ Blank</button>
+        <button class="btn sm" id="p-insert" title="Insert pages from another PDF after the selection">+ PDF…</button>
+        <button class="btn sm" id="p-up" title="Move selected pages earlier">Move up</button>
+        <button class="btn sm" id="p-down" title="Move selected pages later">Move down</button>
+        <button class="btn sm" id="p-extract" title="Save the selected pages as a new PDF">Extract</button>
+      </div>
+      <div class="p-split"><label class="inline"><span>Split every</span><input type="number" id="p-split-n" min="1" max="999" value="1"></label><button class="btn sm" id="p-split">Split</button></div>
+      <p class="note tight">Click, Ctrl/Cmd-click or Shift-click pages to select them. Drag thumbnails to reorder.</p>
+      <ol class="p-thumbs" id="p-thumbs" aria-label="Pages"></ol>
+    </div>
+    <div id="p-side-comments" hidden>
+      <ul class="p-comments" id="p-comments" aria-label="Comments"></ul>
+    </div>
+    <div id="p-side-search" hidden>
+      <label class="art-field">Find<input id="p-find" type="search" placeholder="Search text"></label>
+      <div class="row-btns two"><label class="check"><input type="checkbox" id="p-find-case">Match case</label><label class="check"><input type="checkbox" id="p-find-whole">Whole words</label></div>
+      <p class="note tight" id="p-find-count"></p>
+      <ul class="p-results" id="p-results"></ul>
+    </div>
+  </aside>
+
+  <section class="p-stage" id="p-stage">
+    <div class="view-bar p-view-bar">
+      <button class="btn sm" id="p-open" title="Open PDFs (Ctrl+O)">Open</button>
+      <button class="btn sm" id="p-new" title="New blank PDF">New</button>
+      <button class="btn sm btn-key" id="p-save" title="Save PDF (Ctrl+S)" disabled>Save PDF</button>
+      <span class="p-sep"></span>
+      <button class="btn sm" id="p-undo" title="Undo (Ctrl+Z)" disabled>↶</button>
+      <button class="btn sm" id="p-redo" title="Redo (Ctrl+Shift+Z)" disabled>↷</button>
+      <span class="p-sep"></span>
+      <button class="btn sm" id="p-zoom-out" aria-label="Zoom out">−</button>
+      <select id="p-zoom" aria-label="Zoom"><option value="fit">Fit width</option><option value="page">Fit page</option><option value="0.5">50%</option><option value="0.75">75%</option><option value="1">100%</option><option value="1.25">125%</option><option value="1.5">150%</option><option value="2">200%</option><option value="3">300%</option><option value="4">400%</option></select>
+      <button class="btn sm" id="p-zoom-in" aria-label="Zoom in">+</button>
+      <label class="p-pageno">Page <input type="number" id="p-pageno" min="1" value="1"> / <span id="p-pagecount">0</span></label>
+      <span class="view-tool" id="p-tool-name"></span>
+    </div>
+    <div class="p-tabs" id="p-tabs" role="tablist" aria-label="Open documents"></div>
+    <div class="p-scroll" id="p-scroll">
+      <div class="p-pages" id="p-pages"></div>
+      <div class="stage-empty p-empty" id="p-empty">
+        <p>Drop PDFs here</p>
+        <p class="dim">or use Open. Everything stays on this computer.</p>
+      </div>
+    </div>
+  </section>
+
+  <aside class="panel ppanel p-tasks" aria-label="PDF tools">
+    <div class="p-task-tabs" role="tablist" aria-label="Task">
+      <button class="btn sm" data-task="comment" aria-pressed="true">Comment</button>
+      <button class="btn sm" data-task="fill" aria-pressed="false">Fill &amp; Sign</button>
+      <button class="btn sm" data-task="edit" aria-pressed="false">Edit</button>
+      <button class="btn sm" data-task="redact" aria-pressed="false">Redact</button>
+      <button class="btn sm" data-task="protect" aria-pressed="false">Protect</button>
+      <button class="btn sm" data-task="props" aria-pressed="false">Properties</button>
+    </div>
+
+    <div class="p-tool-grid" id="p-tools-common">
+      <button class="btn sm" data-ptool="select" title="Select, fill fields, move comments (V)">↖ Select</button>
+      <button class="btn sm" data-ptool="hand" title="Pan (H, or hold Space)">✋ Hand</button>
+    </div>
+
+    <section data-taskpanel="comment">
+      <div class="p-tool-grid">
+        <button class="btn sm" data-ptool="highlight" title="Highlight text (Shift+H)">▮ Highlight</button>
+        <button class="btn sm" data-ptool="underline" title="Underline text">U̲ Underline</button>
+        <button class="btn sm" data-ptool="strikeout" title="Strike out text">S̶ Strike</button>
+        <button class="btn sm" data-ptool="note" title="Sticky note (N)">✎ Note</button>
+        <button class="btn sm" data-ptool="textbox" title="Text box (X)">T Text box</button>
+        <button class="btn sm" data-ptool="ink" title="Draw (D)">✍ Draw</button>
+        <button class="btn sm" data-ptool="rectangle" title="Rectangle">▭ Rectangle</button>
+        <button class="btn sm" data-ptool="oval" title="Oval">◯ Oval</button>
+        <button class="btn sm" data-ptool="arrow" title="Arrow">↗ Arrow</button>
+        <button class="btn sm" data-ptool="line" title="Line">╱ Line</button>
+        <button class="btn sm" data-ptool="stamp" title="Stamp">▣ Stamp</button>
+      </div>
+      <div class="row-btns two">
+        <label class="art-field">Color<input type="color" id="p-color" value="#e32222"></label>
+        <label class="art-field">Opacity (%)<input type="number" id="p-opacity" min="5" max="100" value="100"></label>
+        <label class="art-field">Line width (pt)<input type="number" id="p-width" min="0" max="24" step="0.5" value="2"></label>
+        <label class="art-field">Font size (pt)<input type="number" id="p-font" min="4" max="144" value="12"></label>
+      </div>
+      <label class="art-field" id="p-stamp-field">Stamp<select id="p-stamp"><option>Approved</option><option>Not Approved</option><option>Draft</option><option>Final</option><option>Completed</option><option>Confidential</option><option>For Public Release</option><option>Not For Public Release</option><option>For Comment</option><option>Void</option><option>Preliminary Results</option><option>Information Only</option><option>Expired</option><option>Sold</option><option>Departmental</option><option>As Is</option><option>Top Secret</option></select></label>
+      <label class="art-field">Author<input id="p-author" maxlength="80" value="Darkroom"></label>
+    </section>
+
+    <section data-taskpanel="fill" hidden>
+      <div class="p-tool-grid">
+        <button class="btn sm" data-ptool="type" title="Type text anywhere">Ab Add text</button>
+        <button class="btn sm" data-ptool="check" title="Check mark">✓ Check</button>
+        <button class="btn sm" data-ptool="cross" title="Cross">✕ Cross</button>
+        <button class="btn sm" data-ptool="dot" title="Dot">● Dot</button>
+        <button class="btn sm" data-ptool="sign" title="Place your signature">✒ Sign</button>
+      </div>
+      <button class="btn wide" id="p-sig-edit">Create signature…</button>
+      <p class="note" id="p-sig-note">No signature yet.</p>
+      <div class="row-btns two"><button class="btn sm" id="p-form-reset">Clear form</button><button class="btn sm" id="p-flatten-fields">Flatten fields</button></div>
+      <p class="note">Form fields are filled right on the page with the Select tool. Signatures here are drawn or typed marks, like Acrobat's Fill &amp; Sign — not certificate-based digital signatures.</p>
+    </section>
+
+    <section data-taskpanel="edit" hidden>
+      <div class="p-tool-grid">
+        <button class="btn sm" data-ptool="addtext" title="Drag a box to add page text">T+ Add text</button>
+        <button class="btn sm" data-ptool="addimage" title="Drag a box to place an image">▧ Add image</button>
+      </div>
+      <div class="row-btns two">
+        <label class="art-field">Font<select id="p-family"><option value="helvetica">Helvetica</option><option value="times">Times</option><option value="courier">Courier</option></select></label>
+        <label class="art-field">Size (pt)<input type="number" id="p-text-size" min="4" max="144" value="14"></label>
+        <label class="art-field">Color<input type="color" id="p-text-color" value="#000000"></label>
+        <label class="art-field">Align<select id="p-text-align"><option value="left">Left</option><option value="center">Center</option><option value="right">Right</option></select></label>
+      </div>
+      <div class="row-btns two"><label class="check"><input type="checkbox" id="p-text-bold">Bold</label><label class="check"><input type="checkbox" id="p-text-italic">Italic</label></div>
+      <input type="file" id="p-image-file" accept="image/png,image/jpeg" hidden>
+      <div class="row-btns two"><button class="btn sm" id="p-flatten-comments">Flatten comments</button><button class="btn sm" id="p-to-image" title="Send the current page to Image studio">Page → Image studio</button></div>
+      <p class="note">Added text and images become part of the page. Flattening comments bakes them into the page so they can no longer be edited.</p>
+    </section>
+
+    <section data-taskpanel="redact" hidden>
+      <div class="p-tool-grid"><button class="btn sm" data-ptool="redact" title="Drag over an area to mark it for redaction">▬ Mark area</button></div>
+      <label class="art-field">Find text to redact<input id="p-redact-find" placeholder="e.g. an account number"></label>
+      <div class="row-btns two"><label class="check"><input type="checkbox" id="p-redact-case">Match case</label><label class="check"><input type="checkbox" id="p-redact-whole">Whole words</label></div>
+      <button class="btn wide" id="p-redact-mark">Mark all matches</button>
+      <p class="note" id="p-redact-count">No redaction marks.</p>
+      <div class="row-btns two"><button class="btn sm btn-key" id="p-redact-apply" disabled>Apply redactions</button><button class="btn sm" id="p-redact-clear" disabled>Clear marks</button></div>
+      <p class="note">Applying removes the marked text, images and drawings from the file for good, then covers the area in black. Save afterwards to keep the redacted copy.</p>
+    </section>
+
+    <section data-taskpanel="protect" hidden>
+      <p class="note" id="p-security">Not protected.</p>
+      <label class="art-field">Password to open<input type="password" id="p-pw-open" autocomplete="new-password"></label>
+      <label class="art-field">Permissions password<input type="password" id="p-pw-owner" autocomplete="new-password"></label>
+      <label class="art-field">Printing<select id="p-perm-print"><option value="high">Allowed</option><option value="low">Low resolution</option><option value="none">Not allowed</option></select></label>
+      <label class="art-field">Changes<select id="p-perm-changes"><option value="none">None</option><option value="pages">Insert, delete and rotate pages</option><option value="fill_sign">Fill in forms and sign</option><option value="comment">Comment, fill in forms and sign</option><option value="any">Any except extracting pages</option></select></label>
+      <label class="check"><input type="checkbox" id="p-perm-copy">Allow copying text and images</label>
+      <button class="btn wide btn-key" id="p-protect">Protect</button>
+      <button class="btn wide ghost" id="p-unprotect">Remove security</button>
+      <p class="note">AES-256 encryption is written when you save. Permissions apply only with a permissions password; viewers that honor them restrict printing and editing.</p>
+    </section>
+
+    <section data-taskpanel="props" hidden>
+      <label class="art-field">Title<input id="p-title" maxlength="500"></label>
+      <label class="art-field">Author<input id="p-meta-author" maxlength="500"></label>
+      <label class="art-field">Subject<input id="p-subject" maxlength="500"></label>
+      <label class="art-field">Keywords<input id="p-keywords" maxlength="500"></label>
+      <button class="btn wide" id="p-meta-apply">Update properties</button>
+      <dl class="readout" id="p-facts"></dl>
+    </section>
+
+    <section class="p-selected" id="p-selected" hidden>
+      <h3>Selected comment</h3>
+      <label class="art-field">Text<textarea id="p-sel-text" rows="3"></textarea></label>
+      <ul class="p-comments" id="p-sel-replies"></ul>
+      <label class="art-field">Reply<textarea id="p-sel-reply-text" rows="2" placeholder="Write a reply"></textarea></label>
+      <div class="row-btns two"><button class="btn sm" id="p-sel-reply">Reply</button><button class="btn sm" id="p-sel-delete">Delete comment</button></div>
+    </section>
+  </aside>
+</section>
+
+<dialog class="sheet" id="p-password">
+  <h2>Password required</h2>
+  <p class="dim" id="p-password-msg">This PDF is protected.</p>
+  <label class="art-field">Password<input type="password" id="p-password-input" autocomplete="off"></label>
+  <div class="sheet-actions"><button class="btn" id="p-password-cancel">Cancel</button><button class="btn btn-key" id="p-password-ok">Open</button></div>
+</dialog>
+
+<dialog class="sheet wide-sheet" id="p-sig-dialog">
+  <h2>Your signature</h2>
+  <div class="seg" id="p-sig-mode"><button class="btn sm" data-sig="draw" aria-pressed="true">Draw</button><button class="btn sm" data-sig="type" aria-pressed="false">Type</button></div>
+  <canvas id="p-sig-pad" width="760" height="240" aria-label="Draw your signature"></canvas>
+  <label class="art-field" id="p-sig-typed" hidden>Name<input id="p-sig-name" maxlength="80" placeholder="Your name"></label>
+  <div class="sheet-actions"><button class="btn ghost" id="p-sig-clear">Clear</button><button class="btn" id="p-sig-cancel">Cancel</button><button class="btn btn-key" id="p-sig-save">Use signature</button></div>
+</dialog>
+
+<input type="file" id="p-file" accept="application/pdf,.pdf" multiple hidden>
+<input type="file" id="p-insert-file" accept="application/pdf,.pdf" hidden>
+
 <section id="video-workspace" hidden aria-label="Video editor">
   <aside class="panel vpanel vbin" aria-label="Media bin">
     <div class="vhead"><h2>Media</h2><button class="btn sm btn-key" id="v-import">Import</button></div>
@@ -583,6 +771,7 @@
 <input type="file" id="file-project" accept=".darkroom,application/zip" hidden>
 
 <script type="module" src="video.js"></script>
+<script type="module" src="pdf/ui.js"></script>
 <script type="module" src="app.js"></script>
 </body>
 </html>
