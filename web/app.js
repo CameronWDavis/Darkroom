@@ -1,8 +1,7 @@
 
 
 // This app deliberately touches no persistence API. There is no localStorage,
-// sessionStorage, indexedDB, caches, or OPFS call anywhere below except inside
-// readLedger(), which only reads counts in order to display them.
+// sessionStorage, indexedDB, caches, or OPFS call anywhere below.
 
 const $ = (id) => document.getElementById(id);
 const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
@@ -1909,30 +1908,6 @@ window.addEventListener("blur", () => setSpace(false));
 $("btn-shortcuts").onclick = () => $("shortcuts-dialog").showModal();
 $("btn-shortcuts-close").onclick = () => $("shortcuts-dialog").close();
 
-// --- storage ledger --------------------------------------------------------
-
-async function readLedger() {
-  const out = { local: 0, session: 0, idb: 0, cache: 0 };
-  try { out.local = localStorage.length; } catch {}
-  try { out.session = sessionStorage.length; } catch {}
-  try { if (indexedDB.databases) out.idb = (await indexedDB.databases()).length; } catch {}
-  try { if (window.caches) out.cache = (await caches.keys()).length; } catch {}
-  return out;
-}
-
-async function tickLedger() {
-  const r = await readLedger();
-  const el = $("ledger");
-  for (const [k, id] of [["local", "m-local"], ["session", "m-session"], ["idb", "m-idb"], ["cache", "m-cache"]]) {
-    const cell = $(id);
-    cell.textContent = r[k];
-    cell.classList.toggle("hot", r[k] > 0);
-  }
-  el.classList.remove("tick");
-  void el.offsetWidth;
-  el.classList.add("tick");
-}
-
 // --- chrome ----------------------------------------------------------------
 
 let toastTimer;
@@ -2092,5 +2067,3 @@ document.addEventListener("workspacechange", leaveTools);
     fail("Image engine unavailable. Build the WebAssembly package first (see README). Video studio is still available.");
   }
 })();
-tickLedger();
-setInterval(tickLedger, 2000);

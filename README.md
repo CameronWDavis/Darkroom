@@ -79,7 +79,7 @@ Export plays the sequence in real time through the same GPU compositor as the pr
 
 ## Privacy and storage
 
-All media processing runs locally in the browser. Darkroom does not upload your files or automatically save media or edits to browser storage. The storage readout in the header shows storage counts for the page's origin.
+All media processing runs locally in the browser. Darkroom does not upload your files or automatically save media or edits to browser storage.
 
 Web fonts are loaded from Google Fonts, so the page can make network requests for typography. Your media remains on your machine.
 
